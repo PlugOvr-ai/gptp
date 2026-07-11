@@ -1,0 +1,401 @@
+//! IEEE 802.1AS (gPTP) message building and parsing.
+//!
+//! gPTP runs directly over Ethernet (EtherType 0x88F7) to the link-local
+//! multicast address 01:80:C2:00:00:0E, with majorSdoId (transportSpecific) 1.
+
+pub const ETH_P_1588: u16 = 0x88F7;
+pub const PTP_MCAST: [u8; 6] = [0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E];
+
+pub const MT_SYNC: u8 = 0x0;
+pub const MT_PDELAY_REQ: u8 = 0x2;
+pub const MT_PDELAY_RESP: u8 = 0x3;
+pub const MT_FOLLOW_UP: u8 = 0x8;
+pub const MT_PDELAY_RESP_FUP: u8 = 0xA;
+pub const MT_ANNOUNCE: u8 = 0xB;
+
+const FLAG_TWO_STEP: u16 = 0x0200;
+const FLAG_PTP_TIMESCALE: u16 = 0x0008;
+
+const HDR_LEN: usize = 34;
+
+/// PTP timestamp: 48-bit seconds + 32-bit nanoseconds (TAI timescale).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Timestamp {
+    pub secs: u64,
+    pub nanos: u32,
+}
+
+impl Timestamp {
+    pub fn to_ns(self) -> i128 {
+        self.secs as i128 * 1_000_000_000 + self.nanos as i128
+    }
+
+    fn write(&self, buf: &mut [u8]) {
+        buf[0..6].copy_from_slice(&self.secs.to_be_bytes()[2..8]);
+        buf[6..10].copy_from_slice(&self.nanos.to_be_bytes());
+    }
+
+    fn parse(b: &[u8]) -> Self {
+        let mut s = [0u8; 8];
+        s[2..8].copy_from_slice(&b[0..6]);
+        Timestamp {
+            secs: u64::from_be_bytes(s),
+            nanos: u32::from_be_bytes([b[6], b[7], b[8], b[9]]),
+        }
+    }
+}
+
+/// Grandmaster fields carried in an Announce message, used for BMCA comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnnounceData {
+    pub priority1: u8,
+    pub clock_class: u8,
+    pub clock_accuracy: u8,
+    pub variance: u16,
+    pub priority2: u8,
+    pub gm_identity: [u8; 8],
+    pub steps_removed: u16,
+    pub time_source: u8,
+}
+
+impl AnnounceData {
+    /// Dataset comparison key: lower compares as better, per IEEE 1588 BMCA order.
+    pub fn bmca_key(&self) -> (u8, u8, u8, u16, u8, [u8; 8]) {
+        (
+            self.priority1,
+            self.clock_class,
+            self.clock_accuracy,
+            self.variance,
+            self.priority2,
+            self.gm_identity,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Msg {
+    Announce {
+        source: [u8; 10],
+        data: AnnounceData,
+    },
+    Sync {
+        source: [u8; 10],
+    },
+    PdelayReq {
+        seq: u16,
+        source: [u8; 10],
+    },
+    PdelayResp {
+        seq: u16,
+        req_receipt: Timestamp,
+        requesting: [u8; 10],
+        correction_ns: i64,
+    },
+    PdelayRespFup {
+        seq: u16,
+        resp_origin: Timestamp,
+        requesting: [u8; 10],
+        correction_ns: i64,
+    },
+}
+
+/// Parse a PTP payload (Ethernet header already stripped).
+pub fn parse(buf: &[u8]) -> Option<Msg> {
+    if buf.len() < HDR_LEN {
+        return None;
+    }
+    let msg_type = buf[0] & 0x0F;
+    let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    if buf.len() < length {
+        return None;
+    }
+    let mut source = [0u8; 10];
+    source.copy_from_slice(&buf[20..30]);
+    let seq = u16::from_be_bytes([buf[30], buf[31]]);
+    // correctionField is a signed 2^16-scaled nanosecond value.
+    let correction_ns =
+        (i64::from_be_bytes(buf[8..16].try_into().ok()?)) >> 16;
+
+    match msg_type {
+        MT_ANNOUNCE => {
+            if length < HDR_LEN + 30 {
+                return None;
+            }
+            let mut gm_identity = [0u8; 8];
+            gm_identity.copy_from_slice(&buf[53..61]);
+            Some(Msg::Announce {
+                source,
+                data: AnnounceData {
+                    priority1: buf[47],
+                    clock_class: buf[48],
+                    clock_accuracy: buf[49],
+                    variance: u16::from_be_bytes([buf[50], buf[51]]),
+                    priority2: buf[52],
+                    gm_identity,
+                    steps_removed: u16::from_be_bytes([buf[61], buf[62]]),
+                    time_source: buf[63],
+                },
+            })
+        }
+        MT_SYNC => Some(Msg::Sync { source }),
+        MT_PDELAY_REQ => Some(Msg::PdelayReq { seq, source }),
+        MT_PDELAY_RESP => {
+            if length < HDR_LEN + 20 {
+                return None;
+            }
+            let mut requesting = [0u8; 10];
+            requesting.copy_from_slice(&buf[44..54]);
+            Some(Msg::PdelayResp {
+                seq,
+                req_receipt: Timestamp::parse(&buf[34..44]),
+                requesting,
+                correction_ns,
+            })
+        }
+        MT_PDELAY_RESP_FUP => {
+            if length < HDR_LEN + 20 {
+                return None;
+            }
+            let mut requesting = [0u8; 10];
+            requesting.copy_from_slice(&buf[44..54]);
+            Some(Msg::PdelayRespFup {
+                seq,
+                resp_origin: Timestamp::parse(&buf[34..44]),
+                requesting,
+                correction_ns,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Builds outgoing gPTP messages for one port.
+pub struct MsgBuilder {
+    pub clock_identity: [u8; 8],
+    pub port_number: u16,
+    pub domain: u8,
+}
+
+impl MsgBuilder {
+    fn header(
+        &self,
+        msg_type: u8,
+        length: usize,
+        flags: u16,
+        seq: u16,
+        control: u8,
+        log_interval: i8,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; length];
+        b[0] = 0x10 | msg_type; // majorSdoId 1 (gPTP) | messageType
+        b[1] = 0x02; // versionPTP 2
+        b[2..4].copy_from_slice(&(length as u16).to_be_bytes());
+        b[4] = self.domain;
+        b[6..8].copy_from_slice(&flags.to_be_bytes());
+        // correctionField (8..16) = 0, messageTypeSpecific (16..20) = 0
+        b[20..28].copy_from_slice(&self.clock_identity);
+        b[28..30].copy_from_slice(&self.port_number.to_be_bytes());
+        b[30..32].copy_from_slice(&seq.to_be_bytes());
+        b[32] = control;
+        b[33] = log_interval as u8;
+        b
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn announce(
+        &self,
+        seq: u16,
+        log_announce: i8,
+        utc_offset: i16,
+        priority1: u8,
+        clock_class: u8,
+        clock_accuracy: u8,
+        variance: u16,
+        priority2: u8,
+        time_source: u8,
+    ) -> Vec<u8> {
+        // header + announce body (30) + path trace TLV (12)
+        let mut b = self.header(
+            MT_ANNOUNCE,
+            HDR_LEN + 30 + 12,
+            FLAG_PTP_TIMESCALE,
+            seq,
+            5,
+            log_announce,
+        );
+        // originTimestamp (34..44) stays zero per 802.1AS
+        b[44..46].copy_from_slice(&utc_offset.to_be_bytes());
+        b[47] = priority1;
+        b[48] = clock_class;
+        b[49] = clock_accuracy;
+        b[50..52].copy_from_slice(&variance.to_be_bytes());
+        b[52] = priority2;
+        b[53..61].copy_from_slice(&self.clock_identity);
+        b[61..63].copy_from_slice(&0u16.to_be_bytes()); // stepsRemoved
+        b[63] = time_source;
+        // Path trace TLV (required by 802.1AS): our clockIdentity is the whole path.
+        b[64..66].copy_from_slice(&0x0008u16.to_be_bytes());
+        b[66..68].copy_from_slice(&8u16.to_be_bytes());
+        b[68..76].copy_from_slice(&self.clock_identity);
+        b
+    }
+
+    pub fn sync(&self, seq: u16, log_sync: i8) -> Vec<u8> {
+        // Two-step: originTimestamp stays zero, precise value goes in Follow_Up.
+        self.header(MT_SYNC, HDR_LEN + 10, FLAG_TWO_STEP, seq, 0, log_sync)
+    }
+
+    pub fn follow_up(&self, seq: u16, origin: Timestamp, log_sync: i8) -> Vec<u8> {
+        // header + preciseOriginTimestamp (10) + 802.1AS Follow_Up information TLV (32)
+        let mut b = self.header(MT_FOLLOW_UP, HDR_LEN + 10 + 32, 0, seq, 2, log_sync);
+        origin.write(&mut b[34..44]);
+        b[44..46].copy_from_slice(&0x0003u16.to_be_bytes()); // ORGANIZATION_EXTENSION
+        b[46..48].copy_from_slice(&28u16.to_be_bytes());
+        b[48..51].copy_from_slice(&[0x00, 0x80, 0xC2]); // IEEE 802.1 OUI
+        b[51..54].copy_from_slice(&[0x00, 0x00, 0x01]);
+        // cumulativeScaledRateOffset, gmTimeBaseIndicator, lastGmPhaseChange,
+        // scaledLastGmFreqChange all zero: we are the time base and never changed.
+        b
+    }
+
+    pub fn pdelay_req(&self, seq: u16) -> Vec<u8> {
+        self.header(MT_PDELAY_REQ, HDR_LEN + 20, 0, seq, 5, 0)
+    }
+
+    pub fn pdelay_resp(&self, req_seq: u16, requesting: &[u8; 10], t2: Timestamp) -> Vec<u8> {
+        let mut b = self.header(
+            MT_PDELAY_RESP,
+            HDR_LEN + 20,
+            FLAG_TWO_STEP,
+            req_seq,
+            5,
+            0x7F,
+        );
+        t2.write(&mut b[34..44]);
+        b[44..54].copy_from_slice(requesting);
+        b
+    }
+
+    pub fn pdelay_resp_fup(&self, req_seq: u16, requesting: &[u8; 10], t3: Timestamp) -> Vec<u8> {
+        let mut b = self.header(MT_PDELAY_RESP_FUP, HDR_LEN + 20, 0, req_seq, 5, 0x7F);
+        t3.write(&mut b[34..44]);
+        b[44..54].copy_from_slice(requesting);
+        b
+    }
+}
+
+/// Derive an EUI-64 clock identity from the interface MAC address.
+pub fn clock_identity_from_mac(mac: [u8; 6]) -> [u8; 8] {
+    [mac[0], mac[1], mac[2], 0xFF, 0xFE, mac[3], mac[4], mac[5]]
+}
+
+pub fn fmt_clock_identity(id: &[u8; 8]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}.{:02x}{:02x}.{:02x}{:02x}{:02x}",
+        id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn builder() -> MsgBuilder {
+        MsgBuilder {
+            clock_identity: [0xAA, 0xBB, 0xCC, 0xFF, 0xFE, 0x01, 0x02, 0x03],
+            port_number: 1,
+            domain: 0,
+        }
+    }
+
+    #[test]
+    fn timestamp_roundtrip() {
+        let ts = Timestamp {
+            secs: 0x0000_1234_5678_9ABC,
+            nanos: 999_999_999,
+        };
+        let mut buf = [0u8; 10];
+        ts.write(&mut buf);
+        assert_eq!(Timestamp::parse(&buf), ts);
+    }
+
+    #[test]
+    fn announce_roundtrip() {
+        let b = builder().announce(7, 0, 37, 1, 248, 0xFE, 0x4E5D, 1, 0xA0);
+        assert_eq!(b.len(), 76);
+        assert_eq!(b[0], 0x1B); // majorSdoId 1, Announce
+        match parse(&b) {
+            Some(Msg::Announce { data, .. }) => {
+                assert_eq!(data.priority1, 1);
+                assert_eq!(data.clock_class, 248);
+                assert_eq!(data.variance, 0x4E5D);
+                assert_eq!(data.gm_identity, builder().clock_identity);
+                assert_eq!(data.steps_removed, 0);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pdelay_resp_roundtrip() {
+        let requesting = [1u8; 10];
+        let t2 = Timestamp {
+            secs: 100,
+            nanos: 200,
+        };
+        let b = builder().pdelay_resp(42, &requesting, t2);
+        match parse(&b) {
+            Some(Msg::PdelayResp {
+                seq,
+                req_receipt,
+                requesting: r,
+                ..
+            }) => {
+                assert_eq!(seq, 42);
+                assert_eq!(req_receipt, t2);
+                assert_eq!(r, requesting);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_up_has_gptp_tlv() {
+        let b = builder().follow_up(
+            3,
+            Timestamp {
+                secs: 5,
+                nanos: 6,
+            },
+            -3,
+        );
+        assert_eq!(b.len(), 76);
+        assert_eq!(&b[44..48], &[0x00, 0x03, 0x00, 28]);
+        assert_eq!(&b[48..51], &[0x00, 0x80, 0xC2]);
+    }
+
+    #[test]
+    fn bmca_ordering() {
+        let ours = AnnounceData {
+            priority1: 1,
+            clock_class: 248,
+            clock_accuracy: 0xFE,
+            variance: 0xFFFF,
+            priority2: 1,
+            gm_identity: [0; 8],
+            steps_removed: 0,
+            time_source: 0xA0,
+        };
+        let switch = AnnounceData {
+            priority1: 246,
+            clock_class: 6,
+            clock_accuracy: 0x20,
+            variance: 0x4000,
+            priority2: 1,
+            gm_identity: [1; 8],
+            steps_removed: 0,
+            time_source: 0x20,
+        };
+        assert!(ours.bmca_key() < switch.bmca_key());
+    }
+}

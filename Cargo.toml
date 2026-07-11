@@ -1,0 +1,17 @@
+[package]
+name = "gptp-gm"
+version = "0.1.0"
+edition = "2021"
+description = "gPTP (IEEE 802.1AS) grandmaster with timed handover and TUI, replacing an NTS Pico3 in ADAS vehicles"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+ratatui = "0.30"
+crossterm = "0.29"
+
+[profile.release]
+lto = true
+strip = true
