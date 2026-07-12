@@ -52,11 +52,16 @@ cargo build --release            # on the Pi itself
 cargo build --release --target aarch64-unknown-linux-gnu
 ```
 
-The binary needs raw-socket capability:
+The binary needs raw-socket capability, plus `CAP_NET_ADMIN` to enable NIC
+hardware timestamping:
 
 ```sh
-sudo setcap cap_net_raw+ep target/release/gptp-gm   # or run as root
+sudo setcap 'cap_net_raw,cap_net_admin+ep' target/release/gptp-gm
 ```
+
+For the hardware-timestamping path it must also be able to open the PHC
+device (`/dev/ptp*`), which is root-only by default — run as root (the
+systemd service does), or grant access with a udev rule.
 
 ## Usage
 
@@ -83,14 +88,15 @@ Selected options (see `--help` for all):
 | `--domain <n>` | 0 | gPTP domain |
 | `--log-sync-interval <n>` | -3 | log2 Sync interval (-3 = 8/s) |
 | `--utc-offset <s>` | 37 | UTC→TAI offset when the kernel TAI offset is unset |
+| `--force-sw-timestamps` | off | skip NIC hardware timestamping even if available |
 
 ## Run as a systemd service
 
 `scripts/install-service.sh` builds the release binary if needed, installs it
 to `/usr/local/bin/gptp-gm`, and generates + enables a hardened systemd unit
-(sandboxed `DynamicUser` with only `CAP_NET_RAW`, headless mode, restart on
-failure). The first argument is the interface; everything after it is passed
-through to `gptp-gm`:
+(capabilities bounded to `CAP_NET_RAW` + `CAP_NET_ADMIN`, filesystem
+protections, headless mode, restart on failure). The first argument is the
+interface; everything after it is passed through to `gptp-gm`:
 
 ```sh
 sudo ./scripts/install-service.sh eth0 --handover 15
@@ -101,16 +107,27 @@ sudo ./scripts/install-service.sh --uninstall # remove service + binary
 ## Time and timestamping notes
 
 - PTP uses the TAI timescale. If the kernel's TAI offset is configured (e.g.
-  by chrony's `leapsectz right/UTC`), `CLOCK_TAI` is used directly; otherwise
-  the program falls back to `CLOCK_REALTIME` plus `--utc-offset` (37 s since
+  by chrony's `leapsectz right/UTC`), it is used directly; otherwise the
+  program falls back to `CLOCK_REALTIME` plus `--utc-offset` (37 s since
   2017). Keep the Pi's system clock disciplined (GNSS/NTP) — this program
   distributes the system clock, it does not discipline it.
-- Timestamping is in software: the Sync origin timestamp is sampled
-  immediately before the frame is sent and carried in the two-step
-  Follow_Up. On a Pi this yields typically tens of microseconds of accuracy,
-  which matches what the sensors got from a software-stamped source before.
-  For sub-microsecond accuracy, use a NIC with a PHC (e.g. Raspberry Pi 5 /
-  CM4) and extend `net.rs` with `SO_TIMESTAMPING` hardware timestamps.
+- **Hardware timestamping is used automatically** when the NIC supports it
+  (e.g. Raspberry Pi 5 / CM4; check with `ethtool -T eth0`): frames are
+  stamped in the MAC/PHY via `SO_TIMESTAMPING`, and each stamp is converted
+  from the PHC timebase to TAI with a kernel cross-timestamp
+  (`PTP_SYS_OFFSET_PRECISE`, falling back to `PTP_SYS_OFFSET`) — no `phc2sys`
+  needed. Sync origin (via the two-step Follow_Up), pdelay t1–t4: all
+  hardware-stamped. Expect sub-microsecond wire accuracy.
+- **When only software timestamping is available** (e.g. Raspberry Pi 4's
+  NIC has no PHC), the program says so clearly: a red **⚠ SW TIMESTAMPS
+  ONLY** badge in the TUI title bar and Clock panel, `ts=SW-ONLY(!)` in
+  every headless status line, and a startup warning in the event log with
+  the reason. Software mode still uses kernel driver-level timestamps from
+  the socket error queue (better than plain userspace sampling), but
+  accuracy is limited to tens of microseconds — and strict 802.1AS peers may
+  reject the link because the measured peer delay can exceed their
+  `neighborPropDelayThresh` (often 800 ns by default; raise it on the switch
+  or use hardware timestamping).
 
 ## Design notes
 

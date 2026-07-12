@@ -60,6 +60,10 @@ pub struct Config {
     #[arg(long, default_value_t = 37)]
     pub utc_offset: i16,
 
+    /// Do not use NIC hardware timestamping even if available
+    #[arg(long)]
+    pub force_sw_timestamps: bool,
+
     /// Run without the TUI and log status lines to stdout instead
     #[arg(long)]
     pub no_tui: bool,

@@ -30,6 +30,14 @@ impl Timestamp {
         self.secs as i128 * 1_000_000_000 + self.nanos as i128
     }
 
+    pub fn from_ns(ns: i128) -> Self {
+        let ns = ns.max(0);
+        Timestamp {
+            secs: (ns / 1_000_000_000) as u64,
+            nanos: (ns % 1_000_000_000) as u32,
+        }
+    }
+
     fn write(&self, buf: &mut [u8]) {
         buf[0..6].copy_from_slice(&self.secs.to_be_bytes()[2..8]);
         buf[6..10].copy_from_slice(&self.nanos.to_be_bytes());

@@ -62,7 +62,7 @@ fn draw(f: &mut Frame, st: &Status) {
     if has_gauge {
         constraints.push(Constraint::Length(3));
     }
-    constraints.push(Constraint::Length(10));
+    constraints.push(Constraint::Length(11));
     constraints.push(Constraint::Min(5));
     constraints.push(Constraint::Length(1));
     let rows = Layout::default()
@@ -130,9 +130,25 @@ fn draw_title(f: &mut Frame, area: Rect, st: &Status) {
                 .add_modifier(Modifier::BOLD),
         ),
     };
+    let (ts_label, ts_style) = if st.ts_hardware {
+        (
+            " HW TIMESTAMPS ",
+            Style::default().fg(Color::Black).bg(Color::Green),
+        )
+    } else {
+        (
+            " ⚠ SW TIMESTAMPS ONLY ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
     let up = st.started.elapsed().as_secs();
     let title = Line::from(vec![
         Span::styled(label, style),
+        Span::raw("  "),
+        Span::styled(ts_label, ts_style),
         Span::raw(format!(
             "  gPTP on {}   uptime {:02}:{:02}:{:02}",
             st.iface,
@@ -179,6 +195,20 @@ fn draw_handover(f: &mut Frame, area: Rect, st: &Status) {
 fn draw_clock_info(f: &mut Frame, area: Rect, st: &Status) {
     let tai = st.tai_now_secs;
     let (h, m, s) = (tai / 3600 % 24, tai / 60 % 60, tai % 60);
+    let ts_line = if st.ts_hardware {
+        Line::from(vec![
+            Span::styled(format!("{:<22}", "Timestamping"), Style::default().fg(Color::DarkGray)),
+            Span::styled(st.ts_desc.clone(), Style::default().fg(Color::Green)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(format!("{:<22}", "Timestamping"), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("⚠ {} — reduced accuracy", st.ts_desc),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
     let lines = vec![
         info_line("Clock identity", ptp::fmt_clock_identity(&st.clock_identity)),
         info_line("Domain", st.domain.to_string()),
@@ -188,12 +218,13 @@ fn draw_clock_info(f: &mut Frame, area: Rect, st: &Status) {
         ),
         info_line("Clock class", st.clock_class.to_string()),
         info_line("Time source", st.time_source_desc.clone()),
+        ts_line,
         info_line("UTC→TAI offset", format!("{} s", st.utc_offset)),
         info_line("TAI time", format!("{h:02}:{m:02}:{s:02}")),
         info_line(
             "Peer link delay",
             st.link_delay_ns
-                .map(|d| format!("{:.0} ns (sw timestamps)", d))
+                .map(|d| format!("{:.0} ns", d))
                 .unwrap_or_else(|| "no pdelay peer yet".into()),
         ),
     ];

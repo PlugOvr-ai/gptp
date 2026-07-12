@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use crate::clock::TaiClock;
 use crate::config::Config;
-use crate::net::RawSock;
+use crate::net::{RawSock, RawStamp};
 use crate::ptp::{self, AnnounceData, Msg, MsgBuilder, Timestamp};
 use crate::state::{ForeignMaster, Role, Status};
 
@@ -71,6 +71,8 @@ pub fn run(
         st.clock_class = cfg.clock_class;
         st.domain = cfg.domain;
         st.time_source_desc = clock.describe().to_string();
+        st.ts_desc = sock.ts_desc().to_string();
+        st.ts_hardware = sock.is_hardware_ts();
         st.utc_offset = clock.utc_offset();
         st.started = start;
         st.handover_deadline = handover_at;
@@ -83,6 +85,15 @@ pub fn run(
         if let Some(m) = cfg.handover {
             st.log(format!(
                 "Handover mode: will stop announcing after {m} min and yield to the switch"
+            ));
+        }
+        if sock.is_hardware_ts() {
+            st.log(format!("Hardware timestamping active: {}", sock.ts_desc()));
+        } else {
+            st.log(format!(
+                "WARNING: no hardware timestamping ({}) — accuracy limited to tens of µs \
+                 and strict gPTP peers may reject the link (neighborPropDelayThresh)",
+                sock.ts_desc()
             ));
         }
     }
@@ -171,10 +182,14 @@ pub fn run(
             }
             if now >= next_sync {
                 let sync = builder.sync(seq_sync, cfg.log_sync_interval);
-                // Software timestamping: sample the clock immediately before the
-                // Sync hits the wire and carry it in the two-step Follow_Up.
-                let origin = clock.now();
-                let sync_ok = sock.send(&sync).is_ok();
+                // Two-step: the Sync's transmit timestamp (hardware if
+                // available) becomes the Follow_Up's preciseOriginTimestamp.
+                // Fall back to a clock sample taken right before the send.
+                let fallback = clock.now();
+                let (sync_ok, origin) = match sock.send_stamped(&sync) {
+                    Ok(raw) => (true, stamp_to_tai(raw, &sock, &clock).unwrap_or(fallback)),
+                    Err(_) => (false, fallback),
+                };
                 let fup = builder.follow_up(seq_sync, origin, cfg.log_sync_interval);
                 let fup_ok = sync_ok && sock.send(&fup).is_ok();
                 seq_sync = seq_sync.wrapping_add(1);
@@ -194,8 +209,9 @@ pub fn run(
         if now >= next_pdelay {
             seq_pdelay = seq_pdelay.wrapping_add(1);
             let msg = builder.pdelay_req(seq_pdelay);
-            let t1 = clock.now();
-            if sock.send(&msg).is_ok() {
+            let fallback = clock.now();
+            if let Ok(raw) = sock.send_stamped(&msg) {
+                let t1 = stamp_to_tai(raw, &sock, &clock).unwrap_or(fallback);
                 pending_pdelay = Some(PendingPdelay {
                     seq: seq_pdelay,
                     t1,
@@ -228,8 +244,9 @@ pub fn run(
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(100));
         if sock.poll(timeout.as_millis() as i32)? {
-            while let Some(n) = sock.recv(&mut rxbuf)? {
-                let t_rx = clock.now();
+            while let Some((n, stamp)) = sock.recv(&mut rxbuf)? {
+                let t_rx =
+                    stamp_to_tai(stamp, &sock, &clock).unwrap_or_else(|| clock.now());
                 if let Some(msg) = ptp::parse(&rxbuf[..n]) {
                     handle_msg(
                         msg,
@@ -284,8 +301,11 @@ fn handle_msg(
             }
             // Two-step responder: t2 in Pdelay_Resp, t3 in Pdelay_Resp_Follow_Up.
             let resp = builder.pdelay_resp(seq, &source, t_rx);
-            let resp_ok = sock.send(&resp).is_ok();
-            let t3 = clock.now();
+            let fallback = clock.now();
+            let (resp_ok, t3) = match sock.send_stamped(&resp) {
+                Ok(raw) => (true, stamp_to_tai(raw, sock, clock).unwrap_or(fallback)),
+                Err(_) => (false, fallback),
+            };
             let fup = builder.pdelay_resp_fup(seq, &source, t3);
             let _ = resp_ok && sock.send(&fup).is_ok();
             let mut st = state.lock().unwrap();
@@ -382,6 +402,20 @@ fn handle_msg(
                 state.lock().unwrap().counters.foreign_sync_rx += 1;
             }
         }
+    }
+}
+
+/// Convert a raw packet timestamp to the PTP (TAI) timescale. Hardware
+/// stamps are in the PHC timebase and are shifted by a fresh
+/// (PHC, CLOCK_REALTIME) cross-timestamp; software stamps are
+/// CLOCK_REALTIME-based.
+fn stamp_to_tai(stamp: Option<RawStamp>, sock: &RawSock, clock: &TaiClock) -> Option<Timestamp> {
+    let s = stamp?;
+    if s.hardware {
+        let (phc_ns, real_ns) = sock.phc()?.sample_offset_pair()?;
+        Some(clock.realtime_ns_to_tai(s.ts.to_ns() - phc_ns + real_ns))
+    } else {
+        Some(clock.realtime_to_tai(s.ts))
     }
 }
 

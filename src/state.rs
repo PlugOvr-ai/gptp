@@ -44,6 +44,9 @@ pub struct Status {
     pub clock_class: u8,
     pub domain: u8,
     pub time_source_desc: String,
+    /// Active packet-timestamping mode (and why, if degraded).
+    pub ts_desc: String,
+    pub ts_hardware: bool,
     pub utc_offset: i16,
     pub started: Instant,
     pub handover_deadline: Option<Instant>,
@@ -67,6 +70,8 @@ impl Status {
             clock_class: 0,
             domain: 0,
             time_source_desc: String::new(),
+            ts_desc: String::new(),
+            ts_hardware: false,
             utc_offset: 0,
             started: Instant::now(),
             handover_deadline: None,

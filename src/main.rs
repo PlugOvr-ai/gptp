@@ -2,6 +2,7 @@ mod clock;
 mod config;
 mod gm;
 mod net;
+mod phc;
 mod ptp;
 mod state;
 mod tui;
@@ -27,7 +28,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 fn main() -> Result<()> {
     let cfg = Config::parse();
 
-    let sock = net::RawSock::open(&cfg.interface)?;
+    let sock = net::RawSock::open(&cfg.interface, cfg.force_sw_timestamps)?;
     let clock = clock::TaiClock::new(cfg.utc_offset);
     let state = Arc::new(Mutex::new(Status::new(cfg.interface.clone())));
     let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -69,8 +70,13 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
                 Role::ActiveGm => "ACTIVE-GM",
                 Role::Passive => "PASSIVE",
             };
+            let ts = if st.ts_hardware {
+                "hw"
+            } else {
+                "SW-ONLY(!)"
+            };
             println!(
-                "status: {role} announce_tx={} sync_tx={} pdelay_answered={} \
+                "status: {role} ts={ts} announce_tx={} sync_tx={} pdelay_answered={} \
                  foreign_masters={} link_delay={}",
                 st.counters.announce_tx,
                 st.counters.sync_tx,

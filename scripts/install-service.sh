@@ -69,9 +69,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${BIN_DST} ${IFACE} --no-tui${EXTRA_ARGS[@]:+ ${EXTRA_ARGS[*]}}
-DynamicUser=yes
-AmbientCapabilities=CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_RAW
+# Runs as root for /dev/ptp* (PTP hardware clock) access, with capabilities
+# bounded to what raw sockets + NIC timestamping configuration need.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
