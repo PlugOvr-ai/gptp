@@ -92,18 +92,28 @@ fn draw(f: &mut Frame, st: &Status) {
 
     let mid = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+        ])
         .split(mid_area);
     draw_clock_info(f, mid[0], st);
     draw_counters(f, mid[1], st);
+    draw_link_health(f, mid[2], st);
     draw_nodes(f, nodes_area, st);
 
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(28),
+            Constraint::Percentage(38),
+            Constraint::Percentage(34),
+        ])
         .split(bottom_area);
     draw_foreign_masters(f, bottom[0], st);
-    draw_events(f, bottom[1], st);
+    draw_streams(f, bottom[1], st);
+    draw_events(f, bottom[2], st);
 
     let footer = Line::from(vec![
         Span::styled(" q ", Style::default().bold().fg(Color::Black).bg(Color::Gray)),
@@ -266,6 +276,127 @@ fn draw_counters(f: &mut Frame, area: Rect, st: &Status) {
     f.render_widget(table, area);
 }
 
+fn fmt_bps(bps: f64) -> String {
+    if bps >= 1e6 {
+        format!("{:.1} Mb/s", bps / 1e6)
+    } else if bps >= 1e3 {
+        format!("{:.0} kb/s", bps / 1e3)
+    } else {
+        format!("{bps:.0} b/s")
+    }
+}
+
+fn draw_link_health(f: &mut Frame, area: Rect, st: &Status) {
+    let l = &st.link;
+    let mut lines = vec![
+        info_line(
+            "RX",
+            format!("{} ({} pkt/s)", fmt_bps(l.rx_bps), l.rx_pps),
+        ),
+        info_line(
+            "TX",
+            format!("{} ({} pkt/s)", fmt_bps(l.tx_bps), l.tx_pps),
+        ),
+    ];
+    if l.problems.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no drop/error counters raised",
+            Style::default().fg(Color::Green),
+        )));
+    } else {
+        for c in l.problems.iter().take(6) {
+            let style = if c.delta > 0 {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+            let delta = if c.delta > 0 {
+                format!("  +{}/s", c.delta)
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{:<18} {}{delta}", c.name, c.total),
+                style,
+            )));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Link health ({}) ", st.iface)),
+        ),
+        area,
+    );
+}
+
+fn draw_streams(f: &mut Frame, area: Rect, st: &Status) {
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " Streams — sequence-gap loss ({}) ",
+        st.streams.len()
+    ));
+    if st.streams.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "no RTP/AVTP/SOME-IP streams seen",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+    let header = Row::new(vec!["kind", "from", "to", "rate", "lost", "ooo"])
+        .style(Style::default().fg(Color::DarkGray));
+    let rows: Vec<Row> = st
+        .streams
+        .iter()
+        .take(area.height.saturating_sub(3) as usize)
+        .map(|s| {
+            let from = st
+                .nodes
+                .iter()
+                .find(|n| n.mac == s.src_mac)
+                .and_then(|n| n.name.as_ref().map(|(name, _)| name.clone()))
+                .unwrap_or_else(|| crate::inventory::fmt_mac(&s.src_mac));
+            let loss_pct = if s.packets + s.lost > 0 {
+                s.lost as f64 / (s.packets + s.lost) as f64 * 100.0
+            } else {
+                0.0
+            };
+            let style = if s.lost > 0 {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                s.kind.to_string(),
+                from,
+                s.dst.clone(),
+                fmt_bps(s.rate_bps),
+                format!("{} ({loss_pct:.2}%)", s.lost),
+                s.out_of_order.to_string(),
+            ])
+            .style(style)
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(7),
+            Constraint::Length(18),
+            Constraint::Length(20),
+            Constraint::Length(11),
+            Constraint::Length(14),
+            Constraint::Min(4),
+        ],
+    )
+    .header(header)
+    .block(block);
+    f.render_widget(table, area);
+}
+
 fn draw_nodes(f: &mut Frame, area: Rect, st: &Status) {
     let block = Block::default().borders(Borders::ALL).title(format!(
         " Network nodes — {} seen (RTT = network latency, not sync accuracy) ",
@@ -284,7 +415,7 @@ fn draw_nodes(f: &mut Frame, area: Rect, st: &Status) {
         return;
     }
     let header = Row::new(vec![
-        "Name", "IP", "MAC", "RTT", "avg", "jitter", "loss", "seen", "via",
+        "Name", "IP", "MAC", "load", "RTT", "avg", "jitter", "loss", "seen", "via",
     ])
     .style(Style::default().fg(Color::DarkGray));
     let us = |v: Option<f64>| v.map_or("-".to_string(), |x| format!("{:.0} µs", x));
@@ -310,6 +441,7 @@ fn draw_nodes(f: &mut Frame, area: Rect, st: &Status) {
                     .map_or("-".to_string(), |(name, _)| name.clone()),
                 n.ip.map_or("-".to_string(), |i| i.to_string()),
                 crate::inventory::fmt_mac(&n.mac),
+                fmt_bps(n.rate_bps),
                 us(n.rtt_last_us),
                 us(n.rtt_avg_us),
                 us(n.jitter_us) + if jitter_warn { " !" } else { "" },
@@ -331,6 +463,7 @@ fn draw_nodes(f: &mut Frame, area: Rect, st: &Status) {
             Constraint::Length(18),
             Constraint::Length(15),
             Constraint::Length(18),
+            Constraint::Length(11),
             Constraint::Length(9),
             Constraint::Length(9),
             Constraint::Length(11),

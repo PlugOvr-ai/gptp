@@ -19,11 +19,13 @@ use anyhow::{bail, Context, Result};
 
 use crate::names::{self, StaticNames};
 use crate::state::{NameSource, NodeInfo, ProbeMethod, Status};
+use crate::streams::StreamTracker;
 
 const ETH_P_ALL: u16 = 0x0003;
 const ETH_P_ARP: u16 = 0x0806;
 const ETH_P_IPV4: u16 = 0x0800;
 const ETH_P_LLDP: u16 = 0x88CC;
+const ETH_P_AVTP: u16 = 0x22F0;
 
 const MDNS_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_PORT: u16 = 5353;
@@ -39,6 +41,8 @@ struct Node {
     tick: Option<Tick>,
     icmp_seq: u16,
     last_name_query: Option<Instant>,
+    bytes: u64,
+    bytes_last: u64,
 }
 
 /// One probe round: ICMP echo + ARP request sent together. Replies fill in
@@ -87,6 +91,7 @@ fn event_loop(
     let our_ip = socks.our_ip;
     let icmp_id = std::process::id() as u16;
     let mut nodes: HashMap<[u8; 6], Node> = HashMap::new();
+    let mut streams = StreamTracker::default();
     let mut next_probe = Instant::now() + PROBE_INTERVAL;
     let mut next_sweep = Instant::now();
     let mut buf = [0u8; 2048];
@@ -116,7 +121,12 @@ fn event_loop(
 
         if now >= next_probe {
             next_probe = now + PROBE_INTERVAL;
+            for alarm in streams.tick() {
+                state.lock().unwrap().log(alarm);
+            }
             for node in nodes.values_mut() {
+                node.info.rate_bps = (node.bytes - node.bytes_last) as f64 * 8.0;
+                node.bytes_last = node.bytes;
                 let Some(ip) = node.info.ip else { continue };
                 finalize_tick(node);
                 node.icmp_seq = node.icmp_seq.wrapping_add(1);
@@ -152,7 +162,14 @@ fn event_loop(
                 if pkttype == libc::PACKET_OUTGOING {
                     continue;
                 }
-                handle_frame(&buf[..n], our_mac, &static_names, &mut nodes, state);
+                handle_frame(
+                    &buf[..n],
+                    our_mac,
+                    &static_names,
+                    &mut nodes,
+                    &mut streams,
+                    state,
+                );
             }
             // mDNS answers sent to us unicast instead of to the group.
             while let Some(n) = socks.recv_mdns(&mut buf)? {
@@ -176,7 +193,7 @@ fn event_loop(
             }
         }
 
-        publish(&nodes, state);
+        publish(&nodes, &streams, state);
     }
     Ok(())
 }
@@ -186,6 +203,7 @@ fn handle_frame(
     our_mac: [u8; 6],
     static_names: &StaticNames,
     nodes: &mut HashMap<[u8; 6], Node>,
+    streams: &mut StreamTracker,
     state: &Arc<Mutex<Status>>,
 ) {
     if frame.len() < 14 {
@@ -224,11 +242,18 @@ fn handle_frame(
                     dns_names = names::parse_dns_names(payload);
                 } else if dst_port == 67 {
                     dhcp_name = names::parse_dhcp_hostname(payload);
+                } else {
+                    let dst_ip =
+                        Ipv4Addr::new(frame[30], frame[31], frame[32], frame[33]);
+                    streams.observe_udp(src, dst_ip, dst_port, payload, frame.len());
                 }
             }
         }
         ETH_P_LLDP => {
             lldp_name = names::parse_lldp_sysname(&frame[14..]);
+        }
+        ETH_P_AVTP => {
+            streams.observe_avtp(src, &frame[14..], frame.len());
         }
         _ => {}
     }
@@ -248,10 +273,13 @@ fn handle_frame(
             tick: None,
             icmp_seq: 0,
             last_name_query: None,
+            bytes: 0,
+            bytes_last: 0,
         }
     });
     node.info.last_seen = now;
     node.info.frames += 1;
+    node.bytes += frame.len() as u64;
     // First learned IP wins: nodes are keyed by MAC, and a multi-homed MAC
     // (e.g. a management interface with an alias) must not flap.
     if node.info.ip.is_none() && ip.is_some() {
@@ -376,10 +404,16 @@ fn sweep(socks: &Sockets, our_mac: [u8; 6], our_ip: Option<Ipv4Addr>, net: Ipv4A
     }
 }
 
-fn publish(nodes: &HashMap<[u8; 6], Node>, state: &Arc<Mutex<Status>>) {
+fn publish(
+    nodes: &HashMap<[u8; 6], Node>,
+    streams: &StreamTracker,
+    state: &Arc<Mutex<Status>>,
+) {
     let mut list: Vec<NodeInfo> = nodes.values().map(|n| n.info.clone()).collect();
     list.sort_by_key(|n| (n.ip.map(u32::from), n.mac));
-    state.lock().unwrap().nodes = list;
+    let mut st = state.lock().unwrap();
+    st.nodes = list;
+    st.streams = streams.snapshot();
 }
 
 pub fn fmt_mac(mac: &[u8; 6]) -> String {

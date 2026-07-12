@@ -67,6 +67,8 @@ pub struct NodeInfo {
     pub probes_sent: u64,
     pub probes_lost: u64,
     pub method: ProbeMethod,
+    /// Observed traffic from this node, bits/s over the last second.
+    pub rate_bps: f64,
 }
 
 impl NodeInfo {
@@ -83,6 +85,7 @@ impl NodeInfo {
             probes_sent: 0,
             probes_lost: 0,
             method: ProbeMethod::None,
+            rate_bps: 0.0,
         }
     }
 
@@ -95,6 +98,39 @@ impl NodeInfo {
         }
         self.name = Some((name, source));
     }
+}
+
+/// One error/drop counter of the local interface.
+#[derive(Clone)]
+pub struct CounterStat {
+    pub name: String,
+    pub total: u64,
+    /// Increase during the last sampling second.
+    pub delta: u64,
+}
+
+/// Local interface health from /sys/class/net/<if>/statistics.
+#[derive(Clone, Default)]
+pub struct LinkHealth {
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+    pub rx_pps: u64,
+    pub tx_pps: u64,
+    /// Error counters with a nonzero total, most recently increased first.
+    pub problems: Vec<CounterStat>,
+}
+
+/// A monitored packet stream with a sequence counter (RTP/AVTP/SOME-IP).
+#[derive(Clone)]
+pub struct StreamInfo {
+    pub kind: &'static str,
+    pub src_mac: [u8; 6],
+    pub dst: String,
+    pub rate_bps: f64,
+    pub packets: u64,
+    pub lost: u64,
+    pub duplicates: u64,
+    pub out_of_order: u64,
 }
 
 #[derive(Clone)]
@@ -128,6 +164,8 @@ pub struct Status {
     pub link_delay_ns: Option<f64>,
     pub foreign_masters: Vec<ForeignMaster>,
     pub nodes: Vec<NodeInfo>,
+    pub streams: Vec<StreamInfo>,
+    pub link: LinkHealth,
     pub events: VecDeque<String>,
     pub tai_now_secs: u64,
 }
@@ -153,6 +191,8 @@ impl Status {
             link_delay_ns: None,
             foreign_masters: Vec::new(),
             nodes: Vec::new(),
+            streams: Vec::new(),
+            link: LinkHealth::default(),
             events: VecDeque::new(),
             tai_now_secs: 0,
         }

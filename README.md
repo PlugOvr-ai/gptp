@@ -61,8 +61,26 @@ automotive Ethernet switch after a configurable number of minutes.
   problems, and congestion — RTT jitter spikes correlate with switch queue
   congestion, which is also what inflates gPTP residence times and hurts
   sync.
+- **Link health**: `/sys/class/net/<if>/statistics` sampled every second —
+  rx/tx rate plus drop/error counters. CRC/frame errors (cabling, connectors,
+  PHY — invisible to ping) and missed/fifo errors (receiver overload) raise
+  ALARM events with a hint; totals stay visible in the TUI.
+- **Stream drop detection**: RTP, IEEE 1722/AVTP, and SOME/IP streams carry
+  sequence counters; the tool tracks every such stream it can see and counts
+  actual lost packets per stream — no sensor cooperation needed. Detection
+  is heuristic, so a stream must first prove itself with a run of strictly
+  consecutive counters before losses are counted. Loss raises rate-limited
+  ALARM events. Note: only traffic that reaches our port is measurable —
+  multicast/flooded streams usually are; for unicast sensor-to-ECU paths,
+  mirror the relevant switch port onto ours.
+- **Metrics logging** (`--log-metrics <file>`): appends a JSONL snapshot
+  every 5 s (role, gPTP counters, link errors, per-node RTT/loss/load,
+  per-stream loss) with single rotation at 50 MB. Vehicle faults are
+  intermittent — this lets you correlate "sensor X desynced at 14:32:05"
+  with the network state at that second, after the drive.
 - `--no-tui` runs headless and prints status lines (including per-node
-  latency lines) — use this for a systemd service.
+  latency lines) — use this for a systemd service. ALARM events appear in
+  both the TUI event log and the headless output.
 
 ## Build
 
@@ -112,6 +130,7 @@ Selected options (see `--help` for all):
 | `--scan-subnet <CIDR>` | off | ARP-sweep this subnet (/22../30) to find silent nodes |
 | `--no-inventory` | off | disable node discovery and latency probing |
 | `--names <file>` | off | curated node names, one `<mac\|ip> = <name>` per line |
+| `--log-metrics <file>` | off | append JSONL health snapshots every 5 s |
 
 ## Run as a systemd service
 

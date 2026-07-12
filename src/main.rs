@@ -2,11 +2,14 @@ mod clock;
 mod config;
 mod gm;
 mod inventory;
+mod linkstats;
+mod metrics;
 mod names;
 mod net;
 mod phc;
 mod ptp;
 mod state;
+mod streams;
 mod tui;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,6 +67,18 @@ fn main() -> Result<()> {
             inventory::run(iface, our_mac, scan_subnet, static_names, state, quit)
         }))
     };
+    let mut aux = Vec::new();
+    {
+        let iface = cfg.interface.clone();
+        let state = Arc::clone(&state);
+        let quit = Arc::clone(&inv_quit);
+        aux.push(thread::spawn(move || linkstats::run(iface, state, quit)));
+    }
+    if let Some(path) = cfg.log_metrics.clone() {
+        let state = Arc::clone(&state);
+        let quit = Arc::clone(&inv_quit);
+        aux.push(thread::spawn(move || metrics::run(path, state, quit)));
+    }
 
     let ui_result = if cfg.no_tui {
         run_headless(&state, &cmd_tx)
@@ -74,6 +89,9 @@ fn main() -> Result<()> {
     inv_quit.store(true, Ordering::SeqCst);
     if let Some(inv) = inv {
         let _ = inv.join();
+    }
+    for t in aux {
+        let _ = t.join();
     }
     ui_result?;
     match engine.join() {

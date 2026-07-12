@@ -78,6 +78,11 @@ pub struct Config {
     #[arg(long, value_name = "FILE")]
     pub names: Option<String>,
 
+    /// Append a JSONL metrics snapshot (gPTP counters, link errors, nodes,
+    /// streams) to this file every 5 s, for offline fault correlation
+    #[arg(long, value_name = "FILE")]
+    pub log_metrics: Option<String>,
+
     /// Run without the TUI and log status lines to stdout instead
     #[arg(long)]
     pub no_tui: bool,
