@@ -84,21 +84,18 @@ Selected options (see `--help` for all):
 | `--log-sync-interval <n>` | -3 | log2 Sync interval (-3 = 8/s) |
 | `--utc-offset <s>` | 37 | UTC→TAI offset when the kernel TAI offset is unset |
 
-Example systemd unit:
+## Run as a systemd service
 
-```ini
-[Unit]
-Description=gPTP grandmaster (15 min, then switch takes over)
-After=network-online.target
-Wants=network-online.target
+`scripts/install-service.sh` builds the release binary if needed, installs it
+to `/usr/local/bin/gptp-gm`, and generates + enables a hardened systemd unit
+(sandboxed `DynamicUser` with only `CAP_NET_RAW`, headless mode, restart on
+failure). The first argument is the interface; everything after it is passed
+through to `gptp-gm`:
 
-[Service]
-ExecStart=/usr/local/bin/gptp-gm eth0 --handover 15 --no-tui
-AmbientCapabilities=CAP_NET_RAW
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
+```sh
+sudo ./scripts/install-service.sh eth0 --handover 15
+journalctl -fu gptp-gm                        # follow the status log
+sudo ./scripts/install-service.sh --uninstall # remove service + binary
 ```
 
 ## Time and timestamping notes
