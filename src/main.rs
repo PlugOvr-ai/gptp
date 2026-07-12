@@ -1,6 +1,8 @@
 mod clock;
 mod config;
 mod gm;
+mod inventory;
+mod names;
 mod net;
 mod phc;
 mod ptp;
@@ -28,23 +30,52 @@ extern "C" fn on_signal(_: libc::c_int) {
 fn main() -> Result<()> {
     let cfg = Config::parse();
 
+    let scan_subnet = cfg
+        .scan_subnet
+        .as_deref()
+        .map(inventory::parse_cidr)
+        .transpose()?;
+    let static_names = cfg
+        .names
+        .as_deref()
+        .map(names::load_names_file)
+        .transpose()?
+        .unwrap_or_default();
+
     let sock = net::RawSock::open(&cfg.interface, cfg.force_sw_timestamps)?;
+    let our_mac = sock.mac;
     let clock = clock::TaiClock::new(cfg.utc_offset);
     let state = Arc::new(Mutex::new(Status::new(cfg.interface.clone())));
     let (cmd_tx, cmd_rx) = mpsc::channel();
+    let inv_quit = Arc::new(AtomicBool::new(false));
 
     let engine = {
         let cfg = cfg.clone();
         let state = Arc::clone(&state);
         thread::spawn(move || gm::run(cfg, sock, clock, state, cmd_rx))
     };
-
-    if cfg.no_tui {
-        run_headless(&state, &cmd_tx)?;
+    let inv = if cfg.no_inventory {
+        None
     } else {
-        tui::run(Arc::clone(&state), cmd_tx)?;
-    }
+        let iface = cfg.interface.clone();
+        let state = Arc::clone(&state);
+        let quit = Arc::clone(&inv_quit);
+        Some(thread::spawn(move || {
+            inventory::run(iface, our_mac, scan_subnet, static_names, state, quit)
+        }))
+    };
 
+    let ui_result = if cfg.no_tui {
+        run_headless(&state, &cmd_tx)
+    } else {
+        tui::run(Arc::clone(&state), cmd_tx)
+    };
+
+    inv_quit.store(true, Ordering::SeqCst);
+    if let Some(inv) = inv {
+        let _ = inv.join();
+    }
+    ui_result?;
     match engine.join() {
         Ok(res) => res,
         Err(_) => anyhow::bail!("grandmaster engine panicked"),
@@ -77,15 +108,40 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
             };
             println!(
                 "status: {role} ts={ts} announce_tx={} sync_tx={} pdelay_answered={} \
-                 foreign_masters={} link_delay={}",
+                 foreign_masters={} nodes={} link_delay={}",
                 st.counters.announce_tx,
                 st.counters.sync_tx,
                 st.counters.pdelay_resp_tx,
                 st.foreign_masters.len(),
+                st.nodes.len(),
                 st.link_delay_ns
                     .map(|d| format!("{d:.0}ns"))
                     .unwrap_or_else(|| "n/a".into()),
             );
+            let us = |v: Option<f64>| v.map_or("-".into(), |x| format!("{x:.0}µs"));
+            for n in &st.nodes {
+                println!(
+                    "node: {} name={} mac={} rtt={} avg={} jitter={} loss={}/{} via={}",
+                    n.ip.map_or("-".into(), |i| i.to_string()),
+                    n.name
+                        .as_ref()
+                        .map_or("-".into(), |(name, src)| format!(
+                            "\"{name}\"({})",
+                            src.label()
+                        )),
+                    inventory::fmt_mac(&n.mac),
+                    us(n.rtt_last_us),
+                    us(n.rtt_avg_us),
+                    us(n.jitter_us),
+                    n.probes_lost,
+                    n.probes_sent,
+                    match n.method {
+                        state::ProbeMethod::Icmp => "icmp",
+                        state::ProbeMethod::Arp => "arp",
+                        state::ProbeMethod::None => "passive",
+                    },
+                );
+            }
         }
         for _ in 0..50 {
             if !RUNNING.load(Ordering::SeqCst) {

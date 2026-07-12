@@ -25,6 +25,78 @@ pub struct Counters {
     pub foreign_sync_rx: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProbeMethod {
+    None,
+    Icmp,
+    Arp,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NameSource {
+    /// From the --names file; never overwritten by discovered names.
+    Static,
+    Dhcp,
+    Mdns,
+    Lldp,
+}
+
+impl NameSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            NameSource::Static => "static",
+            NameSource::Dhcp => "dhcp",
+            NameSource::Mdns => "mdns",
+            NameSource::Lldp => "lldp",
+        }
+    }
+}
+
+/// A device seen on the network segment (inventory), with network-level
+/// latency stats. RTT/jitter describe path+stack latency, not sync accuracy.
+#[derive(Clone)]
+pub struct NodeInfo {
+    pub mac: [u8; 6],
+    pub ip: Option<std::net::Ipv4Addr>,
+    pub name: Option<(String, NameSource)>,
+    pub last_seen: Instant,
+    pub frames: u64,
+    pub rtt_last_us: Option<f64>,
+    pub rtt_avg_us: Option<f64>,
+    pub jitter_us: Option<f64>,
+    pub probes_sent: u64,
+    pub probes_lost: u64,
+    pub method: ProbeMethod,
+}
+
+impl NodeInfo {
+    pub fn new(mac: [u8; 6], now: Instant) -> Self {
+        NodeInfo {
+            mac,
+            ip: None,
+            name: None,
+            last_seen: now,
+            frames: 0,
+            rtt_last_us: None,
+            rtt_avg_us: None,
+            jitter_us: None,
+            probes_sent: 0,
+            probes_lost: 0,
+            method: ProbeMethod::None,
+        }
+    }
+
+    /// Set the display name; static (curated) names always win.
+    pub fn set_name(&mut self, name: String, source: NameSource) {
+        if source != NameSource::Static
+            && matches!(self.name, Some((_, NameSource::Static)))
+        {
+            return;
+        }
+        self.name = Some((name, source));
+    }
+}
+
 #[derive(Clone)]
 pub struct ForeignMaster {
     pub data: AnnounceData,
@@ -55,6 +127,7 @@ pub struct Status {
     /// Smoothed peer-to-peer link delay measured by our own Pdelay_Req, ns.
     pub link_delay_ns: Option<f64>,
     pub foreign_masters: Vec<ForeignMaster>,
+    pub nodes: Vec<NodeInfo>,
     pub events: VecDeque<String>,
     pub tai_now_secs: u64,
 }
@@ -79,6 +152,7 @@ impl Status {
             counters: Counters::default(),
             link_delay_ns: None,
             foreign_masters: Vec::new(),
+            nodes: Vec::new(),
             events: VecDeque::new(),
             tai_now_secs: 0,
         }

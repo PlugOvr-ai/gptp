@@ -64,6 +64,20 @@ pub struct Config {
     #[arg(long)]
     pub force_sw_timestamps: bool,
 
+    /// Actively ARP-sweep this subnet (e.g. 10.0.0.0/24, max /22) to find
+    /// nodes that never talk on their own
+    #[arg(long, value_name = "CIDR")]
+    pub scan_subnet: Option<String>,
+
+    /// Disable the node inventory (passive discovery + ICMP/ARP latency probes)
+    #[arg(long)]
+    pub no_inventory: bool,
+
+    /// Names file for the inventory: one "<mac|ip> = <display name>" per
+    /// line. Curated names always win over discovered ones.
+    #[arg(long, value_name = "FILE")]
+    pub names: Option<String>,
+
     /// Run without the TUI and log status lines to stdout instead
     #[arg(long)]
     pub no_tui: bool,

@@ -41,8 +41,28 @@ automotive Ethernet switch after a configurable number of minutes.
   verdict), and an event log.
   Keys: `q` quit, `g` toggle GM on/off manually, `r` restart the handover
   countdown (reactivates the GM if already handed over).
-- `--no-tui` runs headless and prints status lines — use this for a systemd
-  service.
+- **Node inventory with latency probing**: passively learns the MAC/IP of
+  every device that sends any traffic on the segment, and probes each known
+  IP once per second — ICMP echo, falling back to ARP-request RTT for nodes
+  that ignore ICMP. The TUI shows per node: IP, MAC, last/average RTT,
+  jitter, probe loss, and last-seen age; jitter above 1 ms is flagged red.
+  `--scan-subnet 10.0.0.0/24` additionally ARP-sweeps a subnet every 60 s to
+  find silent nodes; `--no-inventory` turns the feature off.
+  **Node names** come from four sources, curated names always winning:
+  a `--names` file (`<mac|ip> = <display name>` per line — recommended, since
+  a vehicle network is fixed), DHCP hostname snooping (option 12), mDNS
+  (passive announcements plus an active reverse lookup for unnamed nodes,
+  once a minute), and LLDP system name (which in practice names the switch).
+  Closed sensors that speak none of these can only be named via the names
+  file. **Interpretation
+  caveat:** RTT/jitter are *network + node stack* latency, deliberately not a
+  claim about a node's gPTP sync accuracy (silent 802.1AS slaves don't expose
+  their offset). What the numbers are good for: reachability, gross path
+  problems, and congestion — RTT jitter spikes correlate with switch queue
+  congestion, which is also what inflates gPTP residence times and hurts
+  sync.
+- `--no-tui` runs headless and prints status lines (including per-node
+  latency lines) — use this for a systemd service.
 
 ## Build
 
@@ -89,6 +109,9 @@ Selected options (see `--help` for all):
 | `--log-sync-interval <n>` | -3 | log2 Sync interval (-3 = 8/s) |
 | `--utc-offset <s>` | 37 | UTC→TAI offset when the kernel TAI offset is unset |
 | `--force-sw-timestamps` | off | skip NIC hardware timestamping even if available |
+| `--scan-subnet <CIDR>` | off | ARP-sweep this subnet (/22../30) to find silent nodes |
+| `--no-inventory` | off | disable node discovery and latency probing |
+| `--names <file>` | off | curated node names, one `<mac\|ip> = <name>` per line |
 
 ## Run as a systemd service
 

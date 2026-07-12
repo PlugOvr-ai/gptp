@@ -63,7 +63,8 @@ fn draw(f: &mut Frame, st: &Status) {
         constraints.push(Constraint::Length(3));
     }
     constraints.push(Constraint::Length(11));
-    constraints.push(Constraint::Min(5));
+    constraints.push(Constraint::Min(6));
+    constraints.push(Constraint::Length(9));
     constraints.push(Constraint::Length(1));
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -80,8 +81,9 @@ fn draw(f: &mut Frame, st: &Status) {
         None
     };
     let mid_area = rows[idx];
-    let bottom_area = rows[idx + 1];
-    let footer_area = rows[idx + 2];
+    let nodes_area = rows[idx + 1];
+    let bottom_area = rows[idx + 2];
+    let footer_area = rows[idx + 3];
 
     draw_title(f, title_area, st);
     if let Some(area) = gauge_area {
@@ -94,6 +96,7 @@ fn draw(f: &mut Frame, st: &Status) {
         .split(mid_area);
     draw_clock_info(f, mid[0], st);
     draw_counters(f, mid[1], st);
+    draw_nodes(f, nodes_area, st);
 
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
@@ -260,6 +263,84 @@ fn draw_counters(f: &mut Frame, area: Rect, st: &Status) {
     ];
     let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(10)])
         .block(Block::default().borders(Borders::ALL).title(" Traffic "));
+    f.render_widget(table, area);
+}
+
+fn draw_nodes(f: &mut Frame, area: Rect, st: &Status) {
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " Network nodes — {} seen (RTT = network latency, not sync accuracy) ",
+        st.nodes.len()
+    ));
+    if st.nodes.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "no nodes discovered yet — nodes appear when they send any traffic \
+                 (use --scan-subnet to probe silent ones)",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+    let header = Row::new(vec![
+        "Name", "IP", "MAC", "RTT", "avg", "jitter", "loss", "seen", "via",
+    ])
+    .style(Style::default().fg(Color::DarkGray));
+    let us = |v: Option<f64>| v.map_or("-".to_string(), |x| format!("{:.0} µs", x));
+    let rows: Vec<Row> = st
+        .nodes
+        .iter()
+        .map(|n| {
+            let loss = if n.probes_sent > 0 {
+                format!("{}/{}", n.probes_lost, n.probes_sent)
+            } else {
+                "-".to_string()
+            };
+            let age = n.last_seen.elapsed().as_secs();
+            let jitter_warn = n.jitter_us.is_some_and(|j| j > 1000.0);
+            let style = if jitter_warn {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                n.name
+                    .as_ref()
+                    .map_or("-".to_string(), |(name, _)| name.clone()),
+                n.ip.map_or("-".to_string(), |i| i.to_string()),
+                crate::inventory::fmt_mac(&n.mac),
+                us(n.rtt_last_us),
+                us(n.rtt_avg_us),
+                us(n.jitter_us) + if jitter_warn { " !" } else { "" },
+                loss,
+                format!("{age}s ago"),
+                match n.method {
+                    crate::state::ProbeMethod::Icmp => "icmp",
+                    crate::state::ProbeMethod::Arp => "arp",
+                    crate::state::ProbeMethod::None => "passive",
+                }
+                .to_string(),
+            ])
+            .style(style)
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(18),
+            Constraint::Length(15),
+            Constraint::Length(18),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Min(7),
+        ],
+    )
+    .header(header)
+    .block(block);
     f.render_widget(table, area);
 }
 
