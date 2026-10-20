@@ -67,7 +67,7 @@ pub struct SyncMonitor {
     pub freq_changes: u64,
     /// Drift model discarded because the master's time was erratic.
     pub relearns: u64,
-    /// Jitter bursts (1-s RMS far above baseline) seen by the diagnostics.
+    /// Jitter bursts (1-s jitter level far above baseline) seen by the diagnostics.
     pub bursts: u64,
     pub in_burst: bool,
     /// CSV captures written to --capture-dir.

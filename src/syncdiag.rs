@@ -7,7 +7,8 @@
 //! counters — and
 //!
 //! - logs unusual values of those factors on their own (rate-limited),
-//! - detects **jitter bursts** (1-s RMS of the residual far above its
+//! - detects **jitter bursts** (1-s jitter level of the residual — robust to
+//!   single spikes — far above its
 //!   long-term baseline) and logs which factors coincided with the burst,
 //! - optionally (`--capture-dir`) writes a per-Sync CSV covering ~30 s
 //!   before to ~10 s after any alarm, for offline analysis.
@@ -401,8 +402,8 @@ impl Diag {
         }
         let mut burst_started = false;
         let mut report = None;
-        if let Some(err) = rec.error_ns.filter(|_| self.short.len() == SHORT) {
-            let short_rms = (self.short.iter().map(|e| e * e).sum::<f64>() / SHORT as f64).sqrt();
+        if rec.error_ns.is_some() && self.short.len() == SHORT {
+            let short_rms = jitter_level(&self.short);
             let base_rms = self.baseline_ms.map(f64::sqrt);
             match (&mut self.burst, base_rms) {
                 (None, Some(base))
@@ -421,7 +422,7 @@ impl Diag {
                     burst_started = true;
                 }
                 (None, _) => {
-                    let e2 = err.powi(2);
+                    let e2 = short_rms.powi(2);
                     self.baseline_ms = Some(
                         self.baseline_ms
                             .map_or(e2, |b| b + BASELINE_ALPHA * (e2 - b)),
@@ -444,7 +445,7 @@ impl Diag {
                     }
                     if b.calm >= SHORT {
                         logs.push(format!(
-                            "Jitter burst over after {:.1} s — peak 1-s RMS {}",
+                            "Jitter burst over after {:.1} s — peak 1-s jitter level {}",
                             rec.wall - b.started,
                             fmt_ns(b.peak_rms).trim_start_matches('+')
                         ));
@@ -592,11 +593,21 @@ impl Diag {
             format!("coincides with: {}", found.join("; "))
         };
         format!(
-            "WARNING: jitter burst — 1-s RMS up to {} vs baseline {}; {cause}",
+            "WARNING: jitter burst — 1-s jitter level up to {} vs baseline {}; {cause}",
             abs(short_rms),
             abs(base_rms)
         )
     }
+}
+
+/// Robust 1-s jitter level: square root of the median squared deviation.
+/// Up to 3 of the 8 samples may be outliers (spikes, reported on their own)
+/// without moving it, so a burst means sustained jitter, and a noisy host's
+/// occasional stray sample neither starts a burst nor keeps one alive.
+fn jitter_level(window: &VecDeque<f64>) -> f64 {
+    let mut sq: Vec<f64> = window.iter().map(|e| e * e).collect();
+    sq.sort_by(f64::total_cmp);
+    sq[sq.len() / 2].sqrt()
 }
 
 /// Changed Announce fields of the followed GM (identity changes are GM
@@ -815,7 +826,7 @@ mod tests {
     fn burst_without_cause_says_so() {
         let mut d = Diag::new(TH, None);
         feed(&mut d, 0, 200, |i| (noise(i, 20.0), 3_000, 0));
-        let logs = feed(&mut d, 200, 10, |i| (noise(i, 500.0), 3_000, 0));
+        let logs = feed(&mut d, 200, 20, |i| (noise(i, 500.0) + 600.0, 3_000, 0));
         let burst = logs
             .iter()
             .find(|l| l.contains("jitter burst —"))
@@ -828,7 +839,7 @@ mod tests {
     fn arrival_jitter_is_diagnosed_and_irregular_arrival_logged() {
         let mut d = Diag::new(TH, None);
         feed(&mut d, 0, 200, |i| (noise(i, 20.0), 0, (i % 3) * 100));
-        let logs = feed(&mut d, 200, 10, |i| {
+        let logs = feed(&mut d, 200, 20, |i| {
             (noise(i, 500.0), 0, if i % 2 == 0 { 80_000_000 } else { 0 })
         });
         assert!(
@@ -846,10 +857,11 @@ mod tests {
     fn time_step_cancels_the_burst_it_started() {
         let mut d = Diag::new(TH, None);
         feed(&mut d, 0, 200, |i| (noise(i, 20.0), 0, 0));
-        // Two held-back step samples look like a burst start...
+        // Two held-back step samples are outliers in the 1-s window, not a
+        // burst...
         feed(&mut d, 200, 2, |_| (1e9, 0, 0));
-        assert!(d.in_burst());
-        // ...until the analyzer classifies the third as a step.
+        assert!(!d.in_burst());
+        // ...and the third, classified as a step, does not start one either.
         let mut rec = SampleRec {
             wall: wall_now(),
             seq: 202,
@@ -863,6 +875,26 @@ mod tests {
         let logs = d.on_sample(rec, NOMINAL as f64);
         assert!(!d.in_burst(), "{logs:?}");
         assert_eq!(d.bursts, 0);
+    }
+
+    #[test]
+    fn stray_spikes_neither_start_nor_prolong_a_burst() {
+        let mut d = Diag::new(TH, None);
+        // Calm series with a stray 5 µs spike every 6th sample.
+        let spiky = |i: i128| {
+            let e = if i % 6 == 0 { 5_000.0 } else { noise(i, 20.0) };
+            (e, 0, 0)
+        };
+        let logs = feed(&mut d, 0, 300, spiky);
+        assert_eq!(d.bursts, 0, "{logs:?}");
+        // A real burst on top of the same noisy host still ends.
+        feed(&mut d, 300, 16, |i| (noise(i, 2_000.0) + 1_500.0, 0, 0));
+        assert!(d.in_burst());
+        let logs = feed(&mut d, 316, 40, spiky);
+        assert!(
+            logs.iter().any(|l| l.starts_with("Jitter burst over")),
+            "{logs:?}"
+        );
     }
 
     #[test]
