@@ -4,21 +4,12 @@
 [![Release](https://img.shields.io/github/v/release/PlugOvr-ai/gptp)](https://github.com/PlugOvr-ai/gptp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-A Rust gPTP (IEEE 802.1AS) grandmaster for replacing the Elproma NTS Pico3
-mini time server in our ADAS vehicles with e.g. a Raspberry Pi. It serves
-time on one Ethernet interface so that all other devices in the network take
-over the time signal, and can hand the grandmaster role over to the
-automotive Ethernet switch after a configurable number of minutes.
-
-## Original requirements
-
-> we have currently a NTC Pico in our ADAS vehicles (https://www.lange-electronic.com/de/elproma-nts-pico3-miniatur-timeserver).
-> we like to replace it with e.g. a raspberry pi that runs a gptp grandmaster and all other devices in the network shall take over the time signal.
-> The priority of the time signal that we sends need to be the highest, so that in case there is another time master in the network its overruled.
-> We also have a automotive ethernet switch that initialized itself at boot up and then sends the time signal to the corresponding sensor devices.
-> I want a mode added where you only send time signals for x minutes and after that the ethernet switch will serve as grand master.
-> develop the programm in rust. statime could be a useful crate for you.
-> add a TUI console ui that shows the current status.
+A Rust gPTP (IEEE 802.1AS) grandmaster for vehicle networks, e.g. on a
+Raspberry Pi. It serves time on one Ethernet interface so that all other
+devices in the network take over the time signal, and can hand the
+grandmaster role over to the automotive Ethernet switch after a
+configurable number of minutes. A slave monitor mode watches an existing
+master's time for jumps and instability instead.
 
 ## What it does
 
@@ -123,11 +114,12 @@ automotive Ethernet switch after a configurable number of minutes.
   (rate-limited), e.g. `bridge residence time … typically …`,
   `irregular Sync arrival`, `peer link delay changed`, `GM announce
   changed: clockClass 6 → 7 (holdover, within spec)`. A **jitter burst**
-  — 1-s RMS of the residual > 3× its baseline — is logged one second in
-  with what coincided, e.g.
+  — the residual's 1-s jitter level > 3× its baseline; robust to single
+  spikes, which are reported separately — is logged one second in with
+  what coincided, e.g.
 
   ```
-  WARNING: jitter burst — 1-s RMS up to 1.568 ms vs baseline 3.43 µs; coincides with:
+  WARNING: jitter burst — 1-s jitter level up to 1.568 ms vs baseline 3.43 µs; coincides with:
     Sync arrival jitter up to 639.99 µs (typically ±7.26 µs) — delay in the path;
     14 Syncs missing; Follow_Up delay up to 1.2 ms (typically 0.0)
   ```
@@ -301,7 +293,7 @@ restart the service, so a reinstall picks up new code and arguments.
 
 ## Design notes
 
-- The `statime` crate was evaluated as suggested. It is a sans-IO
+- The `statime` crate was evaluated. It is a sans-IO
   implementation aimed at full BMCA instance operation; for this device we
   need a deliberately non-standard *forced* grandmaster (never yields to the
   BMCA) plus a timed step-down, so the small 802.1AS subset involved

@@ -2,7 +2,7 @@
 
 use clap::Parser;
 
-/// gPTP (IEEE 802.1AS) grandmaster with timed handover — NTS Pico3 replacement.
+/// gPTP (IEEE 802.1AS) grandmaster with timed handover, and slave monitor.
 ///
 /// Sends Announce + Sync/Follow_Up as forced grandmaster on one interface and
 /// answers peer-delay requests. With --handover, announcing stops after the

@@ -2,7 +2,7 @@
 name = "gptp-gm"
 version = "0.1.0"
 edition = "2021"
-description = "gPTP (IEEE 802.1AS) grandmaster with timed handover and TUI, replacing an NTS Pico3 in ADAS vehicles"
+description = "gPTP (IEEE 802.1AS) grandmaster with timed handover, slave monitor, and TUI for vehicle networks"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
