@@ -311,20 +311,19 @@ impl Analyzer {
                 self.outliers = 0;
                 return out;
             }
-            self.suspects.push((x, y_raw, r));
-            out.push(self.apply_step(bx, by, y_raw, pred, r));
+            // A step needs the samples to agree tightly; samples that only
+            // roughly agree are path-delay jitter (e.g. three similarly
+            // queued Syncs at the onset of congestion).
+            let tight = self.th.jitter_ns();
+            if self.suspects.iter().all(|s| (r - s.2).abs() <= tight) {
+                self.suspects.push((x, y_raw, r));
+                out.push(self.apply_step(bx, by, y_raw, pred, r));
+            } else {
+                self.new_suspect(x, y_raw, r, &mut out);
+                return out;
+            }
         } else {
-            for (_, _, sr) in self.suspects.drain(..) {
-                out.push(Anomaly::Spike { residual_ns: sr });
-            }
-            self.suspects.push((x, y_raw, r));
-            self.last_residual = None;
-            self.outliers += 1;
-            if self.outliers >= MIN_SAMPLES {
-                let outliers = self.outliers;
-                self.reset();
-                out.push(Anomaly::Relearn { outliers });
-            }
+            self.new_suspect(x, y_raw, r, &mut out);
             return out;
         }
 
@@ -363,6 +362,22 @@ impl Analyzer {
             }
         }
         out
+    }
+
+    /// The held suspects were spikes; this sample starts a new run.
+    /// Relearns when out-of-model samples keep coming.
+    fn new_suspect(&mut self, x: f64, y_raw: i128, r: f64, out: &mut Vec<Anomaly>) {
+        for (_, _, sr) in self.suspects.drain(..) {
+            out.push(Anomaly::Spike { residual_ns: sr });
+        }
+        self.suspects.push((x, y_raw, r));
+        self.last_residual = None;
+        self.outliers += 1;
+        if self.outliers >= MIN_SAMPLES {
+            let outliers = self.outliers;
+            self.reset();
+            out.push(Anomaly::Relearn { outliers });
+        }
     }
 
     /// The held suspects (the current sample last) agree: the master's time

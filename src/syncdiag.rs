@@ -65,8 +65,9 @@ pub struct SampleRec {
     /// Anomalies at this sample (';'-separated).
     pub note: String,
     // Filled in by Diag:
-    /// Arrival interval minus the expected one, ns (none after reordering
-    /// or a long outage).
+    /// Arrival interval minus the expected one (from the sequence
+    /// difference, so reordered Syncs count too), ns; none after a long
+    /// outage.
     pub arrival_dev_ns: Option<f64>,
     /// GM send interval (origin timestamps) minus nominal, ns.
     pub send_dev_ns: Option<f64>,
@@ -301,11 +302,13 @@ impl Diag {
 
         if let Some((pl, po, ps)) = self.prev {
             let gap = rec.seq.wrapping_sub(ps);
-            // Across a few missing Syncs the expected interval is a
-            // multiple of the nominal one; reordering (gap "negative") and
-            // long outages give no interval.
-            if (1..=8).contains(&gap) {
-                let expected = nominal_ns * gap as f64;
+            // The expected interval is the sequence difference times the
+            // nominal one — across a few missing Syncs, and also for a
+            // reordered Sync (negative difference), which is the most
+            // delayed of all. Long outages give no interval.
+            let signed = gap as i16;
+            if signed != 0 && signed.unsigned_abs() <= 8 {
+                let expected = nominal_ns * signed as f64;
                 rec.arrival_dev_ns = Some((rec.local_ns - pl) as f64 - expected);
                 rec.send_dev_ns = Some((rec.origin_ns - po) as f64 - expected);
             }
@@ -605,14 +608,22 @@ impl Diag {
     }
 }
 
-/// Robust 1-s jitter level: square root of the median squared deviation.
-/// Up to 3 of the 8 samples may be outliers (spikes, reported on their own)
-/// without moving it, so a burst means sustained jitter, and a noisy host's
-/// occasional stray sample neither starts a burst nor keeps one alive.
+/// Robust 1-s jitter level: the spread of the residuals (median absolute
+/// deviation from their median, scaled to σ for normal noise).
+/// - Up to 3 of the 8 samples may be outliers (spikes, reported on their
+///   own), so a burst means sustained jitter and a noisy host's stray
+///   sample neither starts a burst nor keeps one alive.
+/// - A constant offset is a step, not jitter: should the model ever be off
+///   by one, the burst still ends and the step is found against it.
 fn jitter_level(window: &VecDeque<f64>) -> f64 {
-    let mut sq: Vec<f64> = window.iter().map(|e| e * e).collect();
-    sq.sort_by(f64::total_cmp);
-    sq[sq.len() / 2].sqrt()
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let mut vals: Vec<f64> = window.iter().copied().collect();
+    let m = median(&mut vals);
+    let mut dev: Vec<f64> = vals.iter().map(|e| (e - m).abs()).collect();
+    1.4826 * median(&mut dev)
 }
 
 /// Changed Announce fields of the followed GM (identity changes are GM
@@ -791,6 +802,26 @@ mod tests {
     }
 
     #[test]
+    fn reordered_sync_gets_an_arrival_deviation() {
+        let mut d = Diag::new(TH, None);
+        let rec = |seq: u16, local_ms: i128| SampleRec {
+            wall: wall_now(),
+            seq,
+            local_ns: local_ms * 1_000_000,
+            origin_ns: seq as i128 * NOMINAL,
+            error_ns: Some(0.0),
+            ..Default::default()
+        };
+        d.on_sample(rec(10, 0), NOMINAL as f64);
+        d.on_sample(rec(12, 250), NOMINAL as f64);
+        // Seq 11 arrives last, at 253 ms instead of 125 ms: 128 ms late.
+        d.on_sample(rec(11, 253), NOMINAL as f64);
+        let r = d.ring.back().unwrap();
+        assert_eq!(r.arrival_dev_ns, Some(128_000_000.0));
+        assert_eq!(r.seq_gap, 0);
+    }
+
+    #[test]
     fn calm_series_logs_nothing() {
         let mut d = Diag::new(TH, None);
         let logs = feed(&mut d, 0, 400, |i| {
@@ -831,7 +862,7 @@ mod tests {
     fn burst_without_cause_says_so() {
         let mut d = Diag::new(TH, None);
         feed(&mut d, 0, 200, |i| (noise(i, 20.0), 3_000, 0));
-        let logs = feed(&mut d, 200, 20, |i| (noise(i, 500.0) + 600.0, 3_000, 0));
+        let logs = feed(&mut d, 200, 20, |i| (noise(i, 500.0), 3_000, 0));
         let burst = logs
             .iter()
             .find(|l| l.contains("jitter burst —"))
@@ -893,13 +924,41 @@ mod tests {
         let logs = feed(&mut d, 0, 300, spiky);
         assert_eq!(d.bursts, 0, "{logs:?}");
         // A real burst on top of the same noisy host still ends.
-        feed(&mut d, 300, 16, |i| (noise(i, 2_000.0) + 1_500.0, 0, 0));
+        feed(&mut d, 300, 16, |i| (noise(i, 2_000.0), 0, 0));
         assert!(d.in_burst());
         let logs = feed(&mut d, 316, 40, spiky);
         assert!(
             logs.iter().any(|l| l.starts_with("Jitter burst over")),
             "{logs:?}"
         );
+    }
+
+    #[test]
+    fn constant_offset_is_not_jitter() {
+        let mut d = Diag::new(TH, None);
+        feed(&mut d, 0, 200, |i| (noise(i, 20.0), 0, 0));
+        // The model is off by 1.5 µs but the samples are as calm as before:
+        // no burst. (The analyzer reports the step on the third sample.)
+        let base = wall_now();
+        let mut logs = Vec::new();
+        for i in 200..240i128 {
+            let rec = SampleRec {
+                wall: base + i as f64 * 0.125,
+                seq: i as u16,
+                local_ns: i * NOMINAL,
+                origin_ns: 5_000_000_000 + i * NOMINAL,
+                error_ns: Some(noise(i, 20.0) + 1_500.0),
+                link_delay_ns: Some(500.0),
+                note: if i == 202 {
+                    "step".into()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            };
+            logs.extend(d.on_sample(rec, NOMINAL as f64));
+        }
+        assert_eq!(d.bursts, 0, "{logs:?}");
     }
 
     #[test]
