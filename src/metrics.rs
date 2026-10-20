@@ -61,6 +61,7 @@ fn snapshot_json(st: &Status) -> String {
         match st.role {
             Role::ActiveGm => "active-gm",
             Role::Passive => "passive",
+            Role::Monitor => "monitor",
         },
     );
     push_kv(&mut s, "hw_timestamps", &st.ts_hardware.to_string());
@@ -78,6 +79,34 @@ fn snapshot_json(st: &Status) -> String {
         c.announce_rx,
         st.foreign_masters.len()
     ));
+    if let Some(sm) = &st.sync {
+        let num = |v: Option<f64>| v.map_or("null".into(), |x| format!("{x:.0}"));
+        s.push_str(&format!(
+            "\"sync\":{{\"state\":\"{}\",\"gm\":{},\"offset_to_system_ns\":{},\"residual_ns\":{},\"rms_ns\":{},\"peak_ns\":{:.0},\"drift_ppb\":{},\"correction_ns\":{},\"steps\":{},\"last_step_ns\":{},\"spikes\":{},\"freq_changes\":{},\"relearns\":{},\"gm_changes\":{},\"time_base_changes\":{},\"sync_timeouts\":{},\"sync_rx\":{},\"missing_syncs\":{},\"missing_follow_ups\":{}}},",
+            sm.state.label(),
+            sm.gm.map_or("null".into(), |g| format!(
+                "\"{}\"",
+                crate::ptp::fmt_clock_identity(&g.gm_identity)
+            )),
+            num(sm.offset_to_system_ns),
+            num(sm.residual_ns),
+            num(sm.rms_ns),
+            sm.peak_ns,
+            num(sm.drift_ppb),
+            sm.correction_ns.map_or("null".into(), |c| c.to_string()),
+            sm.steps,
+            num(sm.last_step_ns),
+            sm.spikes,
+            sm.freq_changes,
+            sm.relearns,
+            sm.gm_changes,
+            sm.time_base_changes,
+            sm.sync_timeouts,
+            sm.sync_rx,
+            sm.missing_syncs,
+            sm.missing_follow_ups,
+        ));
+    }
     let l = &st.link;
     s.push_str(&format!(
         "\"link\":{{\"rx_bps\":{:.0},\"tx_bps\":{:.0},\"rx_pps\":{},\"tx_pps\":{},\"errors\":[",
@@ -155,6 +184,7 @@ mod tests {
     #[test]
     fn snapshot_is_wellformed_json() {
         let mut st = Status::new("eth0".into());
+        st.sync = Some(crate::state::SyncMonitor::default());
         let mut node = NodeInfo::new([2, 0, 0, 0, 0, 9], Instant::now());
         node.ip = Some("10.0.0.2".parse().unwrap());
         node.set_name("na\"me\\x".into(), crate::state::NameSource::Mdns);
@@ -202,6 +232,7 @@ mod tests {
         assert_eq!(depth, 0);
         assert!(!in_str);
         assert!(line.contains("\"rx_crc_errors\""));
+        assert!(line.contains("\"sync\":{\"state\":\"no-master\""));
         assert!(line.contains("na\\\"me\\\\x"));
     }
 }

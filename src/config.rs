@@ -7,6 +7,8 @@ use clap::Parser;
 /// Sends Announce + Sync/Follow_Up as forced grandmaster on one interface and
 /// answers peer-delay requests. With --handover, announcing stops after the
 /// given number of minutes so the automotive Ethernet switch takes over as GM.
+/// With --monitor, acts as a passive slave instead and reports jumps and
+/// instability in the master's time.
 #[derive(Parser, Clone, Debug)]
 #[command(version, about)]
 pub struct Config {
@@ -15,8 +17,25 @@ pub struct Config {
 
     /// Serve time for this many minutes, then hand over to the switch.
     /// Omit to act as grandmaster indefinitely. Fractions allowed (0.5 = 30 s).
-    #[arg(long, value_name = "MINUTES")]
+    #[arg(long, value_name = "MINUTES", conflicts_with = "monitor")]
     pub handover: Option<f64>,
+
+    /// Slave monitor mode: never announce; follow the best master on the
+    /// link and report time steps, spikes, frequency changes, jitter, Sync
+    /// loss and GM changes. No clock is adjusted.
+    #[arg(long)]
+    pub monitor: bool,
+
+    /// Monitor: a deviation from the drift model beyond this is a spike
+    /// (one sample) or a step (persistent). Default 1000 ns with hardware
+    /// timestamps, 250000 ns with software timestamps.
+    #[arg(long, value_name = "NS", requires = "monitor")]
+    pub jump_threshold: Option<f64>,
+
+    /// Monitor: a change of the master's frequency beyond this is reported.
+    /// Default 100 ppb with hardware timestamps, 5000 ppb with software.
+    #[arg(long, value_name = "PPB", requires = "monitor")]
+    pub freq_threshold: Option<f64>,
 
     /// grandmasterPriority1 — lower wins the BMCA; 1 outranks any default
     /// device (switches/endpoints typically use 246-255)

@@ -9,12 +9,13 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Row, Sparkline, Table};
 use ratatui::Frame;
 
 use crate::gm::Cmd;
+use crate::monitor::fmt_ns;
 use crate::ptp;
-use crate::state::{Role, Status};
+use crate::state::{Role, Status, SyncMonitor, SyncState};
 
 pub fn run(state: Arc<Mutex<Status>>, cmds: Sender<Cmd>) -> Result<()> {
     let mut terminal = ratatui::init();
@@ -58,11 +59,15 @@ fn event_loop(
 
 fn draw(f: &mut Frame, st: &Status) {
     let has_gauge = st.handover_minutes.is_some();
+    let monitor = st.sync.as_ref();
     let mut constraints = vec![Constraint::Length(3)];
     if has_gauge {
         constraints.push(Constraint::Length(3));
     }
-    constraints.push(Constraint::Length(11));
+    constraints.push(Constraint::Length(if monitor.is_some() { 14 } else { 11 }));
+    if monitor.is_some() {
+        constraints.push(Constraint::Length(5));
+    }
     constraints.push(Constraint::Min(6));
     constraints.push(Constraint::Length(9));
     constraints.push(Constraint::Length(1));
@@ -81,6 +86,12 @@ fn draw(f: &mut Frame, st: &Status) {
         None
     };
     let mid_area = rows[idx];
+    let spark_area = if monitor.is_some() {
+        idx += 1;
+        Some(rows[idx])
+    } else {
+        None
+    };
     let nodes_area = rows[idx + 1];
     let bottom_area = rows[idx + 2];
     let footer_area = rows[idx + 3];
@@ -98,9 +109,20 @@ fn draw(f: &mut Frame, st: &Status) {
             Constraint::Percentage(30),
         ])
         .split(mid_area);
-    draw_clock_info(f, mid[0], st);
-    draw_counters(f, mid[1], st);
+    match monitor {
+        Some(sm) => {
+            draw_sync_monitor(f, mid[0], st, sm);
+            draw_monitor_counters(f, mid[1], st, sm);
+        }
+        None => {
+            draw_clock_info(f, mid[0], st);
+            draw_counters(f, mid[1], st);
+        }
+    }
     draw_link_health(f, mid[2], st);
+    if let (Some(area), Some(sm)) = (spark_area, monitor) {
+        draw_residual_history(f, area, sm);
+    }
     draw_nodes(f, nodes_area, st);
 
     let bottom = Layout::default()
@@ -115,19 +137,32 @@ fn draw(f: &mut Frame, st: &Status) {
     draw_streams(f, bottom[1], st);
     draw_events(f, bottom[2], st);
 
-    let footer = Line::from(vec![
-        Span::styled(" q ", Style::default().bold().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" quit   "),
-        Span::styled(" g ", Style::default().bold().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" toggle GM on/off   "),
-        Span::styled(" r ", Style::default().bold().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" restart handover countdown"),
-    ]);
+    let key = |k: &'static str| {
+        Span::styled(k, Style::default().bold().fg(Color::Black).bg(Color::Gray))
+    };
+    let footer = if monitor.is_some() {
+        Line::from(vec![key(" q "), Span::raw(" quit")])
+    } else {
+        Line::from(vec![
+            key(" q "),
+            Span::raw(" quit   "),
+            key(" g "),
+            Span::raw(" toggle GM on/off   "),
+            key(" r "),
+            Span::raw(" restart handover countdown"),
+        ])
+    };
     f.render_widget(Paragraph::new(footer), footer_area);
 }
 
 fn draw_title(f: &mut Frame, area: Rect, st: &Status) {
+    let monitor_label;
     let (label, style) = match st.role {
+        Role::Monitor => {
+            let state = st.sync.as_ref().map_or(SyncState::NoMaster, |s| s.state);
+            monitor_label = format!("  SLAVE MONITOR — {}  ", state.label().to_uppercase());
+            (monitor_label.as_str(), sync_state_style(state).add_modifier(Modifier::BOLD))
+        }
         Role::ActiveGm => (
             "  ACTIVE GRANDMASTER  ",
             Style::default()
@@ -243,6 +278,181 @@ fn draw_clock_info(f: &mut Frame, area: Rect, st: &Status) {
     ];
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Clock ")),
+        area,
+    );
+}
+
+fn sync_state_style(state: SyncState) -> Style {
+    let bg = match state {
+        SyncState::Locked => Color::Green,
+        SyncState::Learning | SyncState::Unstable => Color::Yellow,
+        SyncState::NoMaster | SyncState::SyncLost => Color::Red,
+    };
+    Style::default().fg(Color::Black).bg(bg)
+}
+
+fn draw_sync_monitor(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonitor) {
+    let ns = |v: Option<f64>| v.map_or("-".to_string(), fmt_ns);
+    let alarm = |cond: bool, text: String| {
+        if cond {
+            Span::styled(text, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw(text)
+        }
+    };
+    let keyed = |key: &str, value: Span<'static>| {
+        Line::from(vec![
+            Span::styled(format!("{key:<22}"), Style::default().fg(Color::DarkGray)),
+            value,
+        ])
+    };
+    let gm = match &sm.gm {
+        Some(g) => format!(
+            "{}  p1={} class={} hops={}",
+            ptp::fmt_clock_identity(&g.gm_identity),
+            g.priority1,
+            g.clock_class,
+            g.steps_removed
+        ),
+        None => "none — waiting for Announce".into(),
+    };
+    let ts_value = if st.ts_hardware {
+        Span::styled(st.ts_desc.clone(), Style::default().fg(Color::Green))
+    } else {
+        Span::styled(
+            format!("⚠ {} — reduced accuracy", st.ts_desc),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    };
+    let lines = vec![
+        keyed(
+            "State",
+            Span::styled(format!(" {} ", sm.state.label()), sync_state_style(sm.state)),
+        ),
+        info_line("Grandmaster", gm),
+        info_line(
+            "Master − system clock",
+            sm.offset_to_system_ns
+                .map_or("-".into(), |o| format!("{}  (absolute, coarse)", fmt_ns(o))),
+        ),
+        info_line(
+            "Drift vs local osc.",
+            sm.drift_ppb.map_or("-".into(), |d| format!("{d:+.0} ppb")),
+        ),
+        info_line("Residual (last)", ns(sm.residual_ns)),
+        keyed(
+            "Jitter RMS / peak",
+            alarm(
+                sm.state == SyncState::Unstable,
+                format!(
+                    "{} / {}",
+                    ns(sm.rms_ns).trim_start_matches('+'),
+                    fmt_ns(sm.peak_ns).trim_start_matches('+')
+                ),
+            ),
+        ),
+        keyed(
+            "Steps (last)",
+            alarm(
+                sm.steps > 0,
+                format!("{}  ({})", sm.steps, ns(sm.last_step_ns)),
+            ),
+        ),
+        keyed(
+            "Spikes/freq/relearn",
+            alarm(
+                sm.freq_changes + sm.relearns > 0,
+                format!("{} / {} / {}", sm.spikes, sm.freq_changes, sm.relearns),
+            ),
+        ),
+        keyed(
+            "GM/time-base changes",
+            alarm(
+                sm.gm_changes + sm.time_base_changes > 0,
+                format!("{} / {}", sm.gm_changes, sm.time_base_changes),
+            ),
+        ),
+        keyed("Timestamping", ts_value),
+        info_line(
+            "Peer link delay",
+            st.link_delay_ns
+                .map(|d| format!("{:.0} ns", d))
+                .unwrap_or_else(|| "no pdelay peer yet".into()),
+        ),
+        info_line(
+            "Residence (corr.)",
+            sm.correction_ns.map_or("-".into(), |c| format!("{c} ns")),
+        ),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Sync monitor ")),
+        area,
+    );
+}
+
+fn draw_monitor_counters(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonitor) {
+    let c = &st.counters;
+    let warn = |v: u64| {
+        if v > 0 {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        }
+    };
+    let rows = vec![
+        Row::new(vec!["Sync received".to_string(), sm.sync_rx.to_string()]),
+        Row::new(vec!["Follow_Up received".to_string(), sm.follow_up_rx.to_string()]),
+        Row::new(vec![
+            "Sync interval".to_string(),
+            sm.sync_interval_ms
+                .map_or("-".into(), |ms| format!("{ms:.1} ms")),
+        ]),
+        Row::new(vec!["Syncs missing (seq)".to_string(), sm.missing_syncs.to_string()])
+            .style(warn(sm.missing_syncs)),
+        Row::new(vec![
+            "Follow_Ups missing".to_string(),
+            sm.missing_follow_ups.to_string(),
+        ])
+        .style(warn(sm.missing_follow_ups)),
+        Row::new(vec!["Sync timeouts".to_string(), sm.sync_timeouts.to_string()])
+            .style(warn(sm.sync_timeouts)),
+        Row::new(vec!["Announce received".to_string(), c.announce_rx.to_string()]),
+        Row::new(vec![
+            "Other ports' Sync".to_string(),
+            c.foreign_sync_rx.to_string(),
+        ]),
+        Row::new(vec![
+            "Pdelay_Req answered".to_string(),
+            format!("{} rx / {} resp", c.pdelay_req_rx, c.pdelay_resp_tx),
+        ]),
+        Row::new(vec!["Pdelay_Req sent".to_string(), c.pdelay_req_tx.to_string()]),
+    ];
+    let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(10)])
+        .block(Block::default().borders(Borders::ALL).title(" Traffic "));
+    f.render_widget(table, area);
+}
+
+fn draw_residual_history(f: &mut Frame, area: Rect, sm: &SyncMonitor) {
+    let width = area.width.saturating_sub(2) as usize;
+    let data: Vec<u64> = sm
+        .history
+        .iter()
+        .skip(sm.history.len().saturating_sub(width))
+        .map(|v| v.round() as u64)
+        .collect();
+    let max = data.iter().copied().max().unwrap_or(0);
+    let style = match sm.state {
+        SyncState::Unstable => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::Cyan),
+    };
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " |residual| per Sync — scale 0..{} ",
+                fmt_ns(max as f64).trim_start_matches('+')
+            )))
+            .data(&data)
+            .style(style),
         area,
     );
 }
@@ -497,13 +707,20 @@ fn draw_foreign_masters(f: &mut Frame, area: Rect, st: &Status) {
                     (Role::Passive, _) => {
                         Span::styled(" active GM", Style::default().fg(Color::Yellow))
                     }
+                    (Role::Monitor, true) => {
+                        Span::styled(" following", Style::default().fg(Color::Green))
+                    }
+                    (Role::Monitor, false) => {
+                        Span::styled(" standby", Style::default().fg(Color::DarkGray))
+                    }
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw(format!(
-                        "{}  p1={} class={} ({} ann)",
+                        "{}  p1={} class={} hops={} ({} ann)",
                         ptp::fmt_clock_identity(&fm.data.gm_identity),
                         fm.data.priority1,
                         fm.data.clock_class,
+                        fm.data.steps_removed,
                         fm.announces
                     )),
                     verdict,
@@ -532,4 +749,52 @@ fn draw_events(f: &mut Frame, area: Rect, st: &Status) {
         List::new(items).block(Block::default().borders(Borders::ALL).title(" Events ")),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render(st: &Status) -> String {
+        let mut term = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        term.draw(|f| draw(f, st)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn both_modes_render() {
+        let gm = render(&Status::new("eth0".into()));
+        assert!(gm.contains("ACTIVE GRANDMASTER"));
+
+        let mut st = Status::new("eth0".into());
+        st.role = Role::Monitor;
+        let mut sm = SyncMonitor {
+            state: SyncState::Locked,
+            residual_ns: Some(-42.0),
+            drift_ppb: Some(1234.0),
+            steps: 1,
+            last_step_ns: Some(3e9),
+            ..Default::default()
+        };
+        sm.history.extend((0..200).map(|i| (i % 17) as f64 * 10.0));
+        st.sync = Some(sm);
+        let mon = render(&st);
+        if std::env::var_os("SHOW_TUI").is_some() {
+            println!("{mon}");
+        }
+        assert!(mon.contains("SLAVE MONITOR — LOCKED"));
+        assert!(mon.contains("Sync monitor"));
+        assert!(mon.contains("+3.000000 s"));
+        assert!(!mon.contains("toggle GM"));
+    }
 }

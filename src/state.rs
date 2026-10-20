@@ -11,6 +11,108 @@ pub enum Role {
     ActiveGm,
     /// Handed over (or manually stopped): silent except peer-delay responses.
     Passive,
+    /// Slave monitor (--monitor): follows the best master and watches its
+    /// time for jumps and instability, without adjusting any clock.
+    Monitor,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SyncState {
+    /// No Announce from any master.
+    NoMaster,
+    /// Master known, collecting samples for the drift model.
+    Learning,
+    Locked,
+    /// Residual jitter above threshold.
+    Unstable,
+    /// Master announced but Sync/Follow_Up stopped arriving.
+    SyncLost,
+}
+
+impl SyncState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SyncState::NoMaster => "no-master",
+            SyncState::Learning => "learning",
+            SyncState::Locked => "locked",
+            SyncState::Unstable => "unstable",
+            SyncState::SyncLost => "sync-lost",
+        }
+    }
+}
+
+/// Slave-monitor view of the selected master's time.
+///
+/// "Offset" is master time minus local time; the local reference is a
+/// free-running timebase (raw PHC or CLOCK_MONOTONIC_RAW), so a constant
+/// frequency difference shows up as `drift_ppb` and everything else —
+/// steps, spikes, wander — as the residual of a linear fit.
+#[derive(Clone)]
+pub struct SyncMonitor {
+    pub state: SyncState,
+    pub master_port: Option<[u8; 10]>,
+    pub gm: Option<AnnounceData>,
+    pub sync_interval_ms: Option<f64>,
+    pub sync_rx: u64,
+    pub follow_up_rx: u64,
+    /// Syncs lost according to sequence-number gaps.
+    pub missing_syncs: u64,
+    /// Two-step Syncs whose Follow_Up never arrived.
+    pub missing_follow_ups: u64,
+    pub sync_timeouts: u64,
+    pub gm_changes: u64,
+    pub time_base_changes: u64,
+    pub steps: u64,
+    pub spikes: u64,
+    pub freq_changes: u64,
+    /// Drift model discarded because the master's time was erratic.
+    pub relearns: u64,
+    /// Residual of the last sample against the drift model, ns.
+    pub residual_ns: Option<f64>,
+    /// RMS of the residuals in the fit window, ns.
+    pub rms_ns: Option<f64>,
+    /// Largest |residual| since start (steps excluded), ns.
+    pub peak_ns: f64,
+    pub last_step_ns: Option<f64>,
+    /// Master frequency relative to the local oscillator, ppb.
+    pub drift_ppb: Option<f64>,
+    /// Master time minus our system clock (TAI), ns — shows whether the
+    /// master's absolute time is plausible.
+    pub offset_to_system_ns: Option<f64>,
+    /// correctionField of the last Sync+Follow_Up (bridge residence time), ns.
+    pub correction_ns: Option<i64>,
+    /// Recent |residual| values for the sparkline, ns, newest last.
+    pub history: VecDeque<f64>,
+}
+
+impl Default for SyncMonitor {
+    fn default() -> Self {
+        SyncMonitor {
+            state: SyncState::NoMaster,
+            master_port: None,
+            gm: None,
+            sync_interval_ms: None,
+            sync_rx: 0,
+            follow_up_rx: 0,
+            missing_syncs: 0,
+            missing_follow_ups: 0,
+            sync_timeouts: 0,
+            gm_changes: 0,
+            time_base_changes: 0,
+            steps: 0,
+            spikes: 0,
+            freq_changes: 0,
+            relearns: 0,
+            residual_ns: None,
+            rms_ns: None,
+            peak_ns: 0.0,
+            last_step_ns: None,
+            drift_ppb: None,
+            offset_to_system_ns: None,
+            correction_ns: None,
+            history: VecDeque::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -138,7 +240,8 @@ pub struct ForeignMaster {
     pub data: AnnounceData,
     pub last_seen: Instant,
     pub announces: u64,
-    /// True if this master would beat us in the BMCA while we are active.
+    /// True if this master would beat us in the BMCA while we are active;
+    /// in monitor mode, true for the master we follow.
     pub would_win: bool,
 }
 
@@ -168,6 +271,8 @@ pub struct Status {
     pub link: LinkHealth,
     pub events: VecDeque<String>,
     pub tai_now_secs: u64,
+    /// Present in monitor mode.
+    pub sync: Option<SyncMonitor>,
 }
 
 impl Status {
@@ -195,6 +300,7 @@ impl Status {
             link: LinkHealth::default(),
             events: VecDeque::new(),
             tai_now_secs: 0,
+            sync: None,
         }
     }
 

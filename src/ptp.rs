@@ -80,26 +80,54 @@ impl AnnounceData {
     }
 }
 
+/// 802.1AS Follow_Up information TLV contents.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FollowUpInfo {
+    /// (rateRatio - 1) * 2^41: GM frequency relative to the local relay.
+    pub cumulative_scaled_rate_offset: i32,
+    /// Changes whenever the GM's time base changes (new GM, GM phase/freq step).
+    pub gm_time_base_indicator: u16,
+    /// Phase change of the GM at its last time base change, ns.
+    pub last_gm_phase_change_ns: i64,
+    pub scaled_last_gm_freq_change: i32,
+}
+
 #[derive(Clone, Debug)]
 pub enum Msg {
     Announce {
         source: [u8; 10],
+        log_interval: i8,
         data: AnnounceData,
     },
     Sync {
         source: [u8; 10],
+        seq: u16,
+        log_interval: i8,
+        two_step: bool,
+        /// originTimestamp; only meaningful for one-step Sync.
+        origin: Timestamp,
+        correction_ns: i64,
+    },
+    FollowUp {
+        source: [u8; 10],
+        seq: u16,
+        precise_origin: Timestamp,
+        correction_ns: i64,
+        info: Option<FollowUpInfo>,
     },
     PdelayReq {
         seq: u16,
         source: [u8; 10],
     },
     PdelayResp {
+        source: [u8; 10],
         seq: u16,
         req_receipt: Timestamp,
         requesting: [u8; 10],
         correction_ns: i64,
     },
     PdelayRespFup {
+        source: [u8; 10],
         seq: u16,
         resp_origin: Timestamp,
         requesting: [u8; 10],
@@ -120,6 +148,8 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
     let mut source = [0u8; 10];
     source.copy_from_slice(&buf[20..30]);
     let seq = u16::from_be_bytes([buf[30], buf[31]]);
+    let flags = u16::from_be_bytes([buf[6], buf[7]]);
+    let log_interval = buf[33] as i8;
     // correctionField is a signed 2^16-scaled nanosecond value.
     let correction_ns =
         (i64::from_be_bytes(buf[8..16].try_into().ok()?)) >> 16;
@@ -133,6 +163,7 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
             gm_identity.copy_from_slice(&buf[53..61]);
             Some(Msg::Announce {
                 source,
+                log_interval,
                 data: AnnounceData {
                     priority1: buf[47],
                     clock_class: buf[48],
@@ -145,7 +176,50 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
                 },
             })
         }
-        MT_SYNC => Some(Msg::Sync { source }),
+        MT_SYNC => {
+            if length < HDR_LEN + 10 {
+                return None;
+            }
+            Some(Msg::Sync {
+                source,
+                seq,
+                log_interval,
+                two_step: flags & FLAG_TWO_STEP != 0,
+                origin: Timestamp::parse(&buf[34..44]),
+                correction_ns,
+            })
+        }
+        MT_FOLLOW_UP => {
+            if length < HDR_LEN + 10 {
+                return None;
+            }
+            let info = (length >= HDR_LEN + 10 + 32
+                && buf[44..46] == [0x00, 0x03]
+                && buf[48..54] == [0x00, 0x80, 0xC2, 0x00, 0x00, 0x01])
+                .then(|| {
+                    // lastGmPhaseChange is a 96-bit ScaledNs (ns * 2^16).
+                    let mut phase = [0u8; 16];
+                    phase[4..16].copy_from_slice(&buf[60..72]);
+                    let phase = (i128::from_be_bytes(phase) << 32 >> 32) >> 16;
+                    FollowUpInfo {
+                        cumulative_scaled_rate_offset: i32::from_be_bytes(
+                            buf[54..58].try_into().unwrap(),
+                        ),
+                        gm_time_base_indicator: u16::from_be_bytes([buf[58], buf[59]]),
+                        last_gm_phase_change_ns: phase as i64,
+                        scaled_last_gm_freq_change: i32::from_be_bytes(
+                            buf[72..76].try_into().unwrap(),
+                        ),
+                    }
+                });
+            Some(Msg::FollowUp {
+                source,
+                seq,
+                precise_origin: Timestamp::parse(&buf[34..44]),
+                correction_ns,
+                info,
+            })
+        }
         MT_PDELAY_REQ => Some(Msg::PdelayReq { seq, source }),
         MT_PDELAY_RESP => {
             if length < HDR_LEN + 20 {
@@ -154,6 +228,7 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
             let mut requesting = [0u8; 10];
             requesting.copy_from_slice(&buf[44..54]);
             Some(Msg::PdelayResp {
+                source,
                 seq,
                 req_receipt: Timestamp::parse(&buf[34..44]),
                 requesting,
@@ -167,6 +242,7 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
             let mut requesting = [0u8; 10];
             requesting.copy_from_slice(&buf[44..54]);
             Some(Msg::PdelayRespFup {
+                source,
                 seq,
                 resp_origin: Timestamp::parse(&buf[34..44]),
                 requesting,
@@ -380,6 +456,49 @@ mod tests {
         assert_eq!(b.len(), 76);
         assert_eq!(&b[44..48], &[0x00, 0x03, 0x00, 28]);
         assert_eq!(&b[48..51], &[0x00, 0x80, 0xC2]);
+    }
+
+    #[test]
+    fn sync_follow_up_parse() {
+        let origin = Timestamp {
+            secs: 1_700_000_000,
+            nanos: 123_456_789,
+        };
+        match parse(&builder().sync(9, -3)) {
+            Some(Msg::Sync {
+                seq,
+                log_interval,
+                two_step,
+                ..
+            }) => {
+                assert_eq!(seq, 9);
+                assert_eq!(log_interval, -3);
+                assert!(two_step);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let mut fup = builder().follow_up(9, origin, -3);
+        fup[58..60].copy_from_slice(&7u16.to_be_bytes());
+        // lastGmPhaseChange = -1500 ns, as ScaledNs.
+        let scaled = (-1500i128 << 16).to_be_bytes();
+        fup[60..72].copy_from_slice(&scaled[4..16]);
+        fup[8..16].copy_from_slice(&(250i64 << 16).to_be_bytes());
+        match parse(&fup) {
+            Some(Msg::FollowUp {
+                seq,
+                precise_origin,
+                correction_ns,
+                info: Some(info),
+                ..
+            }) => {
+                assert_eq!(seq, 9);
+                assert_eq!(precise_origin, origin);
+                assert_eq!(correction_ns, 250);
+                assert_eq!(info.gm_time_base_indicator, 7);
+                assert_eq!(info.last_gm_phase_change_ns, -1500);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

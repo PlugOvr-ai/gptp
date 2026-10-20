@@ -78,6 +78,36 @@ automotive Ethernet switch after a configurable number of minutes.
   per-stream loss) with single rotation at 50 MB. Vehicle faults are
   intermittent — this lets you correlate "sensor X desynced at 14:32:05"
   with the network state at that second, after the drive.
+- **Slave monitor mode** (`--monitor`): instead of serving time, act as a
+  passive gPTP slave — follow the best master on the link (BMCA over the
+  received Announces, 1.5 s settle at startup) and watch its time. No clock
+  is adjusted. Each Sync/Follow_Up gives one sample of *master time − local
+  time* against a free-running local timebase (raw PHC with hardware
+  timestamps, `CLOCK_MONOTONIC_RAW` otherwise — so NTP/chrony slewing the
+  system clock never looks like a master problem). A linear fit over the
+  last 8 s models the frequency difference; what it does not predict is
+  reported:
+  - **STEP** — two consecutive samples off the model by the same amount:
+    the master's time jumped (GM change, GM stepped its clock, servo
+    reset). Size is reported exactly, even for jumps of years; the model is
+    re-based and keeps running.
+  - **spike** — a single sample off the model (delayed timestamp, usually
+    bridge queueing). Logged at most every 10 s, all counted.
+  - **frequency change** — the fitted drift leaves its long-term average.
+  - **unstable** — RMS residual above ¼ of the jump threshold (hysteresis).
+  - **erratic** — 8 consecutive samples fit neither the model nor each
+    other; the model is discarded and relearned.
+  - plus Sync timeouts (3 intervals), sequence gaps, missing Follow_Ups,
+    GM changes (Announce) and `gmTimeBaseIndicator` changes (Follow_Up TLV).
+
+  The TUI shows a sync-monitor panel (state, GM, drift, residual,
+  RMS/peak, counters, master time vs. system clock, bridge residence
+  time) and a sparkline of |residual| per Sync. Thresholds default to
+  1 µs / 100 ppb with hardware timestamps and 250 µs / 5000 ppb with
+  software timestamps (`--jump-threshold <ns>`, `--freq-threshold <ppb>`).
+  The peer-delay responder and initiator stay active — a bridge only sends
+  Sync to asCapable ports. Status lines, events and the JSONL metrics
+  (`"sync"` object) cover the monitor too.
 - `--no-tui` runs headless and prints status lines (including per-node
   latency lines) — use this for a systemd service. ALARM events appear in
   both the TUI event log and the headless output.
@@ -112,6 +142,9 @@ gptp-gm eth0 --handover 10
 
 # headless for systemd, 15 min handover
 gptp-gm eth0 --handover 15 --no-tui
+
+# be a slave and watch the switch's time for jumps/instability, with a log
+gptp-gm eth0 --monitor --log-metrics /var/log/gptp-monitor.jsonl
 ```
 
 Selected options (see `--help` for all):
@@ -119,6 +152,9 @@ Selected options (see `--help` for all):
 | Option | Default | Meaning |
 |---|---|---|
 | `--handover <min>` | off | stop announcing after x minutes (fractions allowed) |
+| `--monitor` | off | slave monitor mode: follow the master, report jumps/instability |
+| `--jump-threshold <ns>` | 1000 / 250000 | monitor: spike/step threshold (HW / SW timestamps) |
+| `--freq-threshold <ppb>` | 100 / 5000 | monitor: frequency-change threshold (HW / SW) |
 | `--priority1 <n>` | 1 | grandmasterPriority1, lower wins the BMCA |
 | `--priority2 <n>` | 1 | grandmasterPriority2 |
 | `--clock-class <n>` | 248 | advertised clockClass |
@@ -205,3 +241,23 @@ unshare -rn bash -c '
 Expected: A announces/syncs and hands over after ~5 s, B reports A as a
 foreign master that outranks it, and both measure the peer link delay. The
 frames decode cleanly in `tcpdump -v` / Wireshark.
+
+Monitor mode across a GM change with a time jump: two GMs and a monitor on
+a Linux bridge (which must be told to forward the gPTP multicast); GM C runs
+3 s off via `--utc-offset`:
+
+```sh
+unshare -rn bash -c '
+  ip link add br0 type bridge group_fwd_mask 0x4000
+  for x in A C M; do ip link add veth$x type veth peer name p$x
+    ip link set p$x master br0; ip link set p$x up; ip link set veth$x up; done
+  ip link set br0 up
+  ./target/release/gptp-gm vethA --no-tui --no-inventory --handover 0.1 &
+  ./target/release/gptp-gm vethC --no-tui --no-inventory --priority1 200 --utc-offset 40 &
+  ./target/release/gptp-gm vethM --no-tui --no-inventory --monitor &
+  sleep 16; kill -INT %1 %2 %3'
+```
+
+Expected from the monitor: following A, then `Sync stopped` at the
+handover, `grandmaster changed`, `Sync resumed`, and
+`master time STEP +3.000000 s`.

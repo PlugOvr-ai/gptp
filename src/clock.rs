@@ -6,6 +6,7 @@
 //! CLOCK_REALTIME so kernel software timestamps (which are realtime-based)
 //! can be translated exactly.
 
+use crate::net::{RawSock, RawStamp};
 use crate::ptp::Timestamp;
 
 #[derive(Clone, Copy)]
@@ -55,6 +56,38 @@ impl TaiClock {
         } else {
             "system clock + static UTC offset"
         }
+    }
+}
+
+/// Convert a raw packet timestamp to the PTP (TAI) timescale. Hardware
+/// stamps are in the PHC timebase and are shifted by a fresh
+/// (PHC, CLOCK_REALTIME) cross-timestamp; software stamps are
+/// CLOCK_REALTIME-based.
+pub fn stamp_to_tai(stamp: Option<RawStamp>, sock: &RawSock, clock: &TaiClock) -> Option<Timestamp> {
+    let s = stamp?;
+    if s.hardware {
+        let (phc_ns, real_ns) = sock.phc()?.sample_offset_pair()?;
+        Some(clock.realtime_ns_to_tai(s.ts.to_ns() - phc_ns + real_ns))
+    } else {
+        Some(clock.realtime_to_tai(s.ts))
+    }
+}
+
+/// A packet timestamp on a free-running local timebase that is never stepped
+/// or slewed: the raw PHC for hardware stamps, CLOCK_MONOTONIC_RAW otherwise
+/// (software stamps are shifted from CLOCK_REALTIME by a fresh sample pair).
+/// Used to measure a master's stability independently of NTP/chrony acting
+/// on the system clock.
+pub fn stamp_to_local_ns(stamp: Option<RawStamp>) -> i128 {
+    match stamp {
+        Some(s) if s.hardware => s.ts.to_ns(),
+        Some(s) => {
+            let a = raw(libc::CLOCK_REALTIME).to_ns();
+            let m = raw(libc::CLOCK_MONOTONIC_RAW).to_ns();
+            let b = raw(libc::CLOCK_REALTIME).to_ns();
+            s.ts.to_ns() - (a + b) / 2 + m
+        }
+        None => raw(libc::CLOCK_MONOTONIC_RAW).to_ns(),
     }
 }
 

@@ -4,8 +4,10 @@ mod gm;
 mod inventory;
 mod linkstats;
 mod metrics;
+mod monitor;
 mod names;
 mod net;
+mod pdelay;
 mod phc;
 mod ptp;
 mod state;
@@ -55,7 +57,11 @@ fn main() -> Result<()> {
     let engine = {
         let cfg = cfg.clone();
         let state = Arc::clone(&state);
-        thread::spawn(move || gm::run(cfg, sock, clock, state, cmd_rx))
+        if cfg.monitor {
+            thread::spawn(move || monitor::run(cfg, sock, clock, state, cmd_rx))
+        } else {
+            thread::spawn(move || gm::run(cfg, sock, clock, state, cmd_rx))
+        }
     };
     let inv = if cfg.no_inventory {
         None
@@ -96,7 +102,7 @@ fn main() -> Result<()> {
     ui_result?;
     match engine.join() {
         Ok(res) => res,
-        Err(_) => anyhow::bail!("grandmaster engine panicked"),
+        Err(_) => anyhow::bail!("gPTP engine panicked"),
     }
 }
 
@@ -118,12 +124,36 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
             let role = match st.role {
                 Role::ActiveGm => "ACTIVE-GM",
                 Role::Passive => "PASSIVE",
+                Role::Monitor => "MONITOR",
             };
             let ts = if st.ts_hardware {
                 "hw"
             } else {
                 "SW-ONLY(!)"
             };
+            if let Some(sm) = &st.sync {
+                let ns = |v: Option<f64>| v.map_or("-".into(), monitor::fmt_ns);
+                println!(
+                    "sync: {} gm={} offset_to_system={} residual={} rms={} peak={} \
+                     drift={} steps={} spikes={} freq_changes={} relearns={} gm_changes={} \
+                     sync_timeouts={} missing_syncs={} missing_fups={}",
+                    sm.state.label(),
+                    sm.gm.map_or("-".into(), |g| ptp::fmt_clock_identity(&g.gm_identity)),
+                    ns(sm.offset_to_system_ns),
+                    ns(sm.residual_ns),
+                    ns(sm.rms_ns),
+                    monitor::fmt_ns(sm.peak_ns),
+                    sm.drift_ppb.map_or("-".into(), |d| format!("{d:+.0}ppb")),
+                    sm.steps,
+                    sm.spikes,
+                    sm.freq_changes,
+                    sm.relearns,
+                    sm.gm_changes,
+                    sm.sync_timeouts,
+                    sm.missing_syncs,
+                    sm.missing_follow_ups,
+                );
+            }
             println!(
                 "status: {role} ts={ts} announce_tx={} sync_tx={} pdelay_answered={} \
                  foreign_masters={} nodes={} link_delay={}",

@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::clock::TaiClock;
+use crate::clock::{stamp_to_tai, TaiClock};
 use crate::config::Config;
-use crate::net::{RawSock, RawStamp};
-use crate::ptp::{self, AnnounceData, Msg, MsgBuilder, Timestamp};
+use crate::net::RawSock;
+use crate::pdelay::PeerDelay;
+use crate::ptp::{self, AnnounceData, Msg};
 use crate::state::{ForeignMaster, Role, Status};
 
 pub enum Cmd {
@@ -20,15 +21,6 @@ pub enum Cmd {
     RestartHandover,
 }
 
-struct PendingPdelay {
-    seq: u16,
-    t1: Timestamp,
-    t2: Option<Timestamp>,
-    t4: Option<Timestamp>,
-    resp_correction_ns: i64,
-    sent_at: Instant,
-}
-
 pub fn run(
     cfg: Config,
     sock: RawSock,
@@ -37,7 +29,7 @@ pub fn run(
     cmds: Receiver<Cmd>,
 ) -> Result<()> {
     let clock_identity = ptp::clock_identity_from_mac(sock.mac);
-    let builder = MsgBuilder {
+    let builder = ptp::MsgBuilder {
         clock_identity,
         port_number: 1,
         domain: cfg.domain,
@@ -55,7 +47,6 @@ pub fn run(
 
     let announce_interval = log_to_duration(cfg.log_announce_interval);
     let sync_interval = log_to_duration(cfg.log_sync_interval);
-    let pdelay_interval = Duration::from_secs(1);
 
     let start = Instant::now();
     let mut gm_active = true;
@@ -100,12 +91,9 @@ pub fn run(
 
     let mut seq_announce: u16 = 0;
     let mut seq_sync: u16 = 0;
-    let mut seq_pdelay: u16 = 0;
     let mut next_announce = start;
     let mut next_sync = start;
-    let mut next_pdelay = start + Duration::from_millis(200);
-    let mut pending_pdelay: Option<PendingPdelay> = None;
-    let mut link_delay_ewma: Option<f64> = None;
+    let mut pdelay = PeerDelay::new(start);
     let mut announced_foreign_takeover = false;
     let mut rxbuf = [0u8; 1600];
 
@@ -206,34 +194,10 @@ pub fn run(
             }
         }
 
-        if now >= next_pdelay {
-            seq_pdelay = seq_pdelay.wrapping_add(1);
-            let msg = builder.pdelay_req(seq_pdelay);
-            let fallback = clock.now();
-            if let Ok(raw) = sock.send_stamped(&msg) {
-                let t1 = stamp_to_tai(raw, &sock, &clock).unwrap_or(fallback);
-                pending_pdelay = Some(PendingPdelay {
-                    seq: seq_pdelay,
-                    t1,
-                    t2: None,
-                    t4: None,
-                    resp_correction_ns: 0,
-                    sent_at: now,
-                });
-                state.lock().unwrap().counters.pdelay_req_tx += 1;
-            }
-            next_pdelay = catch_up(next_pdelay, pdelay_interval, now);
-        }
-
-        // Drop stale peer-delay exchanges.
-        if let Some(p) = &pending_pdelay {
-            if now.duration_since(p.sent_at) > Duration::from_millis(900) {
-                pending_pdelay = None;
-            }
-        }
+        pdelay.tick(now, &builder, &sock, &clock, &state);
 
         // Sleep until the next timer, waking early for received frames.
-        let mut deadline = next_pdelay;
+        let mut deadline = pdelay.next;
         if gm_active {
             deadline = deadline.min(next_announce).min(next_sync);
         }
@@ -248,20 +212,16 @@ pub fn run(
                 let t_rx =
                     stamp_to_tai(stamp, &sock, &clock).unwrap_or_else(|| clock.now());
                 if let Some(msg) = ptp::parse(&rxbuf[..n]) {
-                    handle_msg(
-                        msg,
-                        t_rx,
-                        &builder,
-                        &sock,
-                        &clock,
-                        &clock_identity,
-                        &our_announce,
-                        gm_active,
-                        &mut pending_pdelay,
-                        &mut link_delay_ewma,
-                        &mut announced_foreign_takeover,
-                        &state,
-                    );
+                    if !pdelay.handle(&msg, t_rx, &builder, &sock, &clock, &state) {
+                        handle_msg(
+                            msg,
+                            &clock_identity,
+                            &our_announce,
+                            gm_active,
+                            &mut announced_foreign_takeover,
+                            &state,
+                        );
+                    }
                 }
             }
         }
@@ -271,7 +231,7 @@ pub fn run(
             let mut st = state.lock().unwrap();
             st.tai_now_secs = clock.now().secs;
             st.handover_deadline = handover_at;
-            st.link_delay_ns = link_delay_ewma;
+            st.link_delay_ns = pdelay.link_delay_ns;
             let cutoff = Duration::from_secs(10);
             st.foreign_masters
                 .retain(|f| now.duration_since(f.last_seen) < cutoff);
@@ -279,83 +239,16 @@ pub fn run(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_msg(
     msg: Msg,
-    t_rx: Timestamp,
-    builder: &MsgBuilder,
-    sock: &RawSock,
-    clock: &TaiClock,
     clock_identity: &[u8; 8],
     our_announce: &AnnounceData,
     gm_active: bool,
-    pending_pdelay: &mut Option<PendingPdelay>,
-    link_delay_ewma: &mut Option<f64>,
     announced_foreign_takeover: &mut bool,
     state: &Arc<Mutex<Status>>,
 ) {
     match msg {
-        Msg::PdelayReq { seq, source } => {
-            if source[..8] == clock_identity[..] {
-                return;
-            }
-            // Two-step responder: t2 in Pdelay_Resp, t3 in Pdelay_Resp_Follow_Up.
-            let resp = builder.pdelay_resp(seq, &source, t_rx);
-            let fallback = clock.now();
-            let (resp_ok, t3) = match sock.send_stamped(&resp) {
-                Ok(raw) => (true, stamp_to_tai(raw, sock, clock).unwrap_or(fallback)),
-                Err(_) => (false, fallback),
-            };
-            let fup = builder.pdelay_resp_fup(seq, &source, t3);
-            let _ = resp_ok && sock.send(&fup).is_ok();
-            let mut st = state.lock().unwrap();
-            st.counters.pdelay_req_rx += 1;
-            if resp_ok {
-                st.counters.pdelay_resp_tx += 1;
-            }
-        }
-        Msg::PdelayResp {
-            seq,
-            req_receipt,
-            requesting,
-            correction_ns,
-        } => {
-            if requesting[..8] != clock_identity[..] {
-                return;
-            }
-            if let Some(p) = pending_pdelay {
-                if p.seq == seq {
-                    p.t2 = Some(req_receipt);
-                    p.t4 = Some(t_rx);
-                    p.resp_correction_ns = correction_ns;
-                }
-            }
-        }
-        Msg::PdelayRespFup {
-            seq,
-            resp_origin,
-            requesting,
-            correction_ns,
-        } => {
-            if requesting[..8] != clock_identity[..] {
-                return;
-            }
-            let Some(p) = pending_pdelay.take() else {
-                return;
-            };
-            if p.seq != seq {
-                return;
-            }
-            if let (Some(t2), Some(t4)) = (p.t2, p.t4) {
-                let turnaround = resp_origin.to_ns() - t2.to_ns();
-                let roundtrip = t4.to_ns() - p.t1.to_ns();
-                let delay = (roundtrip - turnaround) as f64 / 2.0
-                    - (p.resp_correction_ns + correction_ns) as f64;
-                let ewma = link_delay_ewma.map_or(delay, |e| e * 0.8 + delay * 0.2);
-                *link_delay_ewma = Some(ewma);
-            }
-        }
-        Msg::Announce { source, data } => {
+        Msg::Announce { source, data, .. } => {
             if data.gm_identity == *clock_identity || source[..8] == clock_identity[..] {
                 return;
             }
@@ -397,34 +290,19 @@ fn handle_msg(
                 }
             }
         }
-        Msg::Sync { source } => {
-            if source[..8] != clock_identity[..] {
-                state.lock().unwrap().counters.foreign_sync_rx += 1;
-            }
+        Msg::Sync { source, .. } if source[..8] != clock_identity[..] => {
+            state.lock().unwrap().counters.foreign_sync_rx += 1;
         }
+        _ => {}
     }
 }
 
-/// Convert a raw packet timestamp to the PTP (TAI) timescale. Hardware
-/// stamps are in the PHC timebase and are shifted by a fresh
-/// (PHC, CLOCK_REALTIME) cross-timestamp; software stamps are
-/// CLOCK_REALTIME-based.
-fn stamp_to_tai(stamp: Option<RawStamp>, sock: &RawSock, clock: &TaiClock) -> Option<Timestamp> {
-    let s = stamp?;
-    if s.hardware {
-        let (phc_ns, real_ns) = sock.phc()?.sample_offset_pair()?;
-        Some(clock.realtime_ns_to_tai(s.ts.to_ns() - phc_ns + real_ns))
-    } else {
-        Some(clock.realtime_to_tai(s.ts))
-    }
-}
-
-fn log_to_duration(log: i8) -> Duration {
+pub fn log_to_duration(log: i8) -> Duration {
     Duration::from_secs_f64(2f64.powi(log as i32))
 }
 
 /// Advance a periodic deadline past `now` without accumulating drift.
-fn catch_up(mut next: Instant, interval: Duration, now: Instant) -> Instant {
+pub fn catch_up(mut next: Instant, interval: Duration, now: Instant) -> Instant {
     while next <= now {
         next += interval;
     }
