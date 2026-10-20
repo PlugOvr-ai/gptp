@@ -179,8 +179,22 @@ interface; everything after it is passed through to `gptp-gm`:
 ```sh
 sudo ./scripts/install-service.sh eth0 --handover 15
 journalctl -fu gptp-gm                        # follow the status log
-sudo ./scripts/install-service.sh --uninstall # remove service + binary
+sudo ./scripts/install-service.sh --uninstall # remove service(s) + binary
 ```
+
+With `--monitor` the script installs a separate `gptp-monitor` service, so
+a grandmaster and a monitor can coexist on different interfaces (it warns
+if both target the same one). The directory of a `--log-metrics` file
+(absolute path) is created and made writable despite `ProtectSystem=strict`:
+
+```sh
+sudo ./scripts/install-service.sh eth0 --monitor --log-metrics /var/log/gptp/monitor.jsonl
+journalctl -fu gptp-monitor
+sudo ./scripts/install-service.sh --uninstall monitor   # or: gm
+```
+
+The script always rebuilds (incrementally) before installing, and
+restarts the service, so a reinstall picks up new code and arguments.
 
 ## Time and timestamping notes
 
