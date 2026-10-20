@@ -75,10 +75,9 @@ pub fn run(iface: String, state: Arc<Mutex<Status>>, quit: Arc<AtomicBool>) {
                     } else {
                         ""
                     };
-                    state
-                        .lock()
-                        .unwrap()
-                        .log(format!("ALARM: {iface} {name} +{delta} (total {total}){hint}"));
+                    state.lock().unwrap().log(format!(
+                        "ALARM: {iface} {name} +{delta} (total {total}){hint}"
+                    ));
                 }
             }
         }

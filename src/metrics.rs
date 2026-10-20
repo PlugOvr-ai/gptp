@@ -68,7 +68,8 @@ fn snapshot_json(st: &Status) -> String {
     push_kv(
         &mut s,
         "link_delay_ns",
-        &st.link_delay_ns.map_or("null".into(), |d| format!("{d:.0}")),
+        &st.link_delay_ns
+            .map_or("null".into(), |d| format!("{d:.0}")),
     );
     let c = &st.counters;
     s.push_str(&format!(

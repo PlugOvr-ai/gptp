@@ -24,8 +24,8 @@ pub struct StaticNames {
 /// 10.0.0.7          = Lidar Roof
 /// ```
 pub fn load_names_file(path: &str) -> Result<StaticNames> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading names file {path}"))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading names file {path}"))?;
     let mut names = StaticNames::default();
     for (lineno, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -45,7 +45,10 @@ pub fn load_names_file(path: &str) -> Result<StaticNames> {
         } else if let Ok(ip) = key.parse::<Ipv4Addr>() {
             names.by_ip.insert(ip, name);
         } else {
-            bail!("{path}:{}: {key} is neither a MAC nor an IPv4 address", lineno + 1);
+            bail!(
+                "{path}:{}: {key} is neither a MAC nor an IPv4 address",
+                lineno + 1
+            );
         }
     }
     Ok(names)
@@ -110,8 +113,7 @@ fn parse_dns_inner(p: &[u8]) -> Option<Vec<(Ipv4Addr, String)>> {
     for _ in 0..rrcount.min(64) {
         let (name, next) = decode_dns_name(p, off)?;
         let rtype = u16::from_be_bytes([*p.get(next)?, *p.get(next + 1)?]);
-        let rdlen =
-            u16::from_be_bytes([*p.get(next + 8)?, *p.get(next + 9)?]) as usize;
+        let rdlen = u16::from_be_bytes([*p.get(next + 8)?, *p.get(next + 9)?]) as usize;
         let rdata_off = next + 10;
         let rdata = p.get(rdata_off..rdata_off + rdlen)?;
         match rtype {

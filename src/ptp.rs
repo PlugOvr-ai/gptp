@@ -151,8 +151,7 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
     let flags = u16::from_be_bytes([buf[6], buf[7]]);
     let log_interval = buf[33] as i8;
     // correctionField is a signed 2^16-scaled nanosecond value.
-    let correction_ns =
-        (i64::from_be_bytes(buf[8..16].try_into().ok()?)) >> 16;
+    let correction_ns = (i64::from_be_bytes(buf[8..16].try_into().ok()?)) >> 16;
 
     match msg_type {
         MT_ANNOUNCE => {
@@ -196,22 +195,20 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
             let info = (length >= HDR_LEN + 10 + 32
                 && buf[44..46] == [0x00, 0x03]
                 && buf[48..54] == [0x00, 0x80, 0xC2, 0x00, 0x00, 0x01])
-                .then(|| {
-                    // lastGmPhaseChange is a 96-bit ScaledNs (ns * 2^16).
-                    let mut phase = [0u8; 16];
-                    phase[4..16].copy_from_slice(&buf[60..72]);
-                    let phase = (i128::from_be_bytes(phase) << 32 >> 32) >> 16;
-                    FollowUpInfo {
-                        cumulative_scaled_rate_offset: i32::from_be_bytes(
-                            buf[54..58].try_into().unwrap(),
-                        ),
-                        gm_time_base_indicator: u16::from_be_bytes([buf[58], buf[59]]),
-                        last_gm_phase_change_ns: phase as i64,
-                        scaled_last_gm_freq_change: i32::from_be_bytes(
-                            buf[72..76].try_into().unwrap(),
-                        ),
-                    }
-                });
+            .then(|| {
+                // lastGmPhaseChange is a 96-bit ScaledNs (ns * 2^16).
+                let mut phase = [0u8; 16];
+                phase[4..16].copy_from_slice(&buf[60..72]);
+                let phase = (i128::from_be_bytes(phase) << 32 >> 32) >> 16;
+                FollowUpInfo {
+                    cumulative_scaled_rate_offset: i32::from_be_bytes(
+                        buf[54..58].try_into().unwrap(),
+                    ),
+                    gm_time_base_indicator: u16::from_be_bytes([buf[58], buf[59]]),
+                    last_gm_phase_change_ns: phase as i64,
+                    scaled_last_gm_freq_change: i32::from_be_bytes(buf[72..76].try_into().unwrap()),
+                }
+            });
             Some(Msg::FollowUp {
                 source,
                 seq,
@@ -445,14 +442,7 @@ mod tests {
 
     #[test]
     fn follow_up_has_gptp_tlv() {
-        let b = builder().follow_up(
-            3,
-            Timestamp {
-                secs: 5,
-                nanos: 6,
-            },
-            -3,
-        );
+        let b = builder().follow_up(3, Timestamp { secs: 5, nanos: 6 }, -3);
         assert_eq!(b.len(), 76);
         assert_eq!(&b[44..48], &[0x00, 0x03, 0x00, 28]);
         assert_eq!(&b[48..51], &[0x00, 0x80, 0xC2]);

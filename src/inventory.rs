@@ -232,8 +232,8 @@ fn handle_frame(
             if !spa.is_unspecified() {
                 ip = Some(spa);
             }
-            arp_reply_to_us = u16::from_be_bytes([frame[20], frame[21]]) == 2
-                && frame[0..6] == our_mac;
+            arp_reply_to_us =
+                u16::from_be_bytes([frame[20], frame[21]]) == 2 && frame[0..6] == our_mac;
         }
         ETH_P_IPV4 if frame.len() >= 34 => {
             ip = Some(Ipv4Addr::new(frame[26], frame[27], frame[28], frame[29]));
@@ -243,8 +243,7 @@ fn handle_frame(
                 } else if dst_port == 67 {
                     dhcp_name = names::parse_dhcp_hostname(payload);
                 } else {
-                    let dst_ip =
-                        Ipv4Addr::new(frame[30], frame[31], frame[32], frame[33]);
+                    let dst_ip = Ipv4Addr::new(frame[30], frame[31], frame[32], frame[33]);
                     streams.observe_udp(src, dst_ip, dst_port, payload, frame.len());
                 }
             }
@@ -302,10 +301,10 @@ fn handle_frame(
 
     if is_new {
         let ip_str = ip.map(|i| format!(" ({i})")).unwrap_or_default();
-        state.lock().unwrap().log(format!(
-            "Node discovered: {}{ip_str}",
-            fmt_mac(&src)
-        ));
+        state
+            .lock()
+            .unwrap()
+            .log(format!("Node discovered: {}{ip_str}", fmt_mac(&src)));
     }
 
     // These may name nodes other than the frame's sender.
@@ -404,11 +403,7 @@ fn sweep(socks: &Sockets, our_mac: [u8; 6], our_ip: Option<Ipv4Addr>, net: Ipv4A
     }
 }
 
-fn publish(
-    nodes: &HashMap<[u8; 6], Node>,
-    streams: &StreamTracker,
-    state: &Arc<Mutex<Status>>,
-) {
+fn publish(nodes: &HashMap<[u8; 6], Node>, streams: &StreamTracker, state: &Arc<Mutex<Status>>) {
     let mut list: Vec<NodeInfo> = nodes.values().map(|n| n.info.clone()).collect();
     list.sort_by_key(|n| (n.ip.map(u32::from), n.mac));
     let mut st = state.lock().unwrap();
@@ -601,8 +596,7 @@ impl Sockets {
         let Some(fd) = self.mdns_fd else {
             return Ok(None);
         };
-        let rc =
-            unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        let rc = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if rc < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::WouldBlock {
@@ -715,9 +709,7 @@ impl Sockets {
             return Ok(None);
         };
         loop {
-            let rc = unsafe {
-                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-            };
+            let rc = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
             if rc < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::WouldBlock {
@@ -820,8 +812,12 @@ pub fn parse_cidr(s: &str) -> Result<(Ipv4Addr, u8)> {
     let (addr, prefix) = s
         .split_once('/')
         .with_context(|| format!("{s}: expected CIDR notation like 10.0.0.0/24"))?;
-    let addr: Ipv4Addr = addr.parse().with_context(|| format!("bad address in {s}"))?;
-    let prefix: u8 = prefix.parse().with_context(|| format!("bad prefix in {s}"))?;
+    let addr: Ipv4Addr = addr
+        .parse()
+        .with_context(|| format!("bad address in {s}"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .with_context(|| format!("bad prefix in {s}"))?;
     if !(22..=30).contains(&prefix) {
         bail!("sweep prefix must be /22../30 (got /{prefix})");
     }

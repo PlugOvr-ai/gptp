@@ -63,7 +63,11 @@ impl TaiClock {
 /// stamps are in the PHC timebase and are shifted by a fresh
 /// (PHC, CLOCK_REALTIME) cross-timestamp; software stamps are
 /// CLOCK_REALTIME-based.
-pub fn stamp_to_tai(stamp: Option<RawStamp>, sock: &RawSock, clock: &TaiClock) -> Option<Timestamp> {
+pub fn stamp_to_tai(
+    stamp: Option<RawStamp>,
+    sock: &RawSock,
+    clock: &TaiClock,
+) -> Option<Timestamp> {
     let s = stamp?;
     if s.hardware {
         let (phc_ns, real_ns) = sock.phc()?.sample_offset_pair()?;

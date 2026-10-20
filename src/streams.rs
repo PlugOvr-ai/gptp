@@ -105,11 +105,7 @@ impl StreamTracker {
         if matches!(dst_port, 53 | 67 | 68 | 123 | 5353 | 5355) {
             return;
         }
-        let key = StreamKey::Udp {
-            src,
-            dst,
-            dst_port,
-        };
+        let key = StreamKey::Udp { src, dst, dst_port };
         if let Some(stream) = self.streams.get_mut(&key) {
             if let Some(seq) = extract_seq(stream.kind, payload) {
                 stream.update(seq, frame_len);
@@ -119,14 +115,7 @@ impl StreamTracker {
         // New candidate: RTP first (more specific version check), then SOME/IP.
         for kind in [Kind::Rtp, Kind::SomeIp] {
             if let Some(seq) = extract_seq(kind, payload) {
-                self.insert(
-                    key,
-                    kind,
-                    src,
-                    format!("{dst}:{dst_port}"),
-                    seq,
-                    frame_len,
-                );
+                self.insert(key, kind, src, format!("{dst}:{dst_port}"), seq, frame_len);
                 return;
             }
         }
@@ -300,7 +289,10 @@ fn extract_seq(kind: Kind, p: &[u8]) -> Option<u32> {
             // at 14; the session id (offset 10) increments per sender.
             if p.len() >= 16
                 && p[12] == 0x01
-                && matches!(p[14], 0x00 | 0x01 | 0x02 | 0x40 | 0x41 | 0x80 | 0x81 | 0xA0 | 0xA1)
+                && matches!(
+                    p[14],
+                    0x00 | 0x01 | 0x02 | 0x40 | 0x41 | 0x80 | 0x81 | 0xA0 | 0xA1
+                )
             {
                 Some(u16::from_be_bytes([p[10], p[11]]) as u32)
             } else {

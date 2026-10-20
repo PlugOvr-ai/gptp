@@ -193,9 +193,7 @@ impl NodeInfo {
 
     /// Set the display name; static (curated) names always win.
     pub fn set_name(&mut self, name: String, source: NameSource) {
-        if source != NameSource::Static
-            && matches!(self.name, Some((_, NameSource::Static)))
-        {
+        if source != NameSource::Static && matches!(self.name, Some((_, NameSource::Static))) {
             return;
         }
         self.name = Some((name, source));

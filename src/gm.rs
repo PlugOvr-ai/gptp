@@ -112,7 +112,9 @@ pub fn run(
                         st.log("Manually reactivated: announcing as grandmaster again");
                     } else {
                         st.role = Role::Passive;
-                        st.log("Manually stopped: no longer announcing (pdelay responder stays on)");
+                        st.log(
+                            "Manually stopped: no longer announcing (pdelay responder stays on)",
+                        );
                     }
                 }
                 Cmd::RestartHandover => {
@@ -209,8 +211,7 @@ pub fn run(
             .min(Duration::from_millis(100));
         if sock.poll(timeout.as_millis() as i32)? {
             while let Some((n, stamp)) = sock.recv(&mut rxbuf)? {
-                let t_rx =
-                    stamp_to_tai(stamp, &sock, &clock).unwrap_or_else(|| clock.now());
+                let t_rx = stamp_to_tai(stamp, &sock, &clock).unwrap_or_else(|| clock.now());
                 if let Some(msg) = ptp::parse(&rxbuf[..n]) {
                     if !pdelay.handle(&msg, t_rx, &builder, &sock, &clock, &state) {
                         handle_msg(

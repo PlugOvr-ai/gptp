@@ -137,9 +137,8 @@ fn draw(f: &mut Frame, st: &Status) {
     draw_streams(f, bottom[1], st);
     draw_events(f, bottom[2], st);
 
-    let key = |k: &'static str| {
-        Span::styled(k, Style::default().bold().fg(Color::Black).bg(Color::Gray))
-    };
+    let key =
+        |k: &'static str| Span::styled(k, Style::default().bold().fg(Color::Black).bg(Color::Gray));
     let footer = if monitor.is_some() {
         Line::from(vec![key(" q "), Span::raw(" quit")])
     } else {
@@ -161,7 +160,10 @@ fn draw_title(f: &mut Frame, area: Rect, st: &Status) {
         Role::Monitor => {
             let state = st.sync.as_ref().map_or(SyncState::NoMaster, |s| s.state);
             monitor_label = format!("  SLAVE MONITOR — {}  ", state.label().to_uppercase());
-            (monitor_label.as_str(), sync_state_style(state).add_modifier(Modifier::BOLD))
+            (
+                monitor_label.as_str(),
+                sync_state_style(state).add_modifier(Modifier::BOLD),
+            )
         }
         Role::ActiveGm => (
             "  ACTIVE GRANDMASTER  ",
@@ -215,7 +217,9 @@ fn draw_handover(f: &mut Frame, area: Rect, st: &Status) {
     let total = st.handover_minutes.unwrap_or(0.0) * 60.0;
     let (ratio, label) = match (st.role, st.handover_deadline) {
         (Role::ActiveGm, Some(deadline)) => {
-            let remaining = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64();
             let ratio = if total > 0.0 {
                 (remaining / total).clamp(0.0, 1.0)
             } else {
@@ -230,11 +234,22 @@ fn draw_handover(f: &mut Frame, area: Rect, st: &Status) {
                 ),
             )
         }
-        _ => (0.0, "handed over — switch serves as grandmaster".to_string()),
+        _ => (
+            0.0,
+            "handed over — switch serves as grandmaster".to_string(),
+        ),
     };
     let gauge = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title(" Handover timer "))
-        .gauge_style(Style::default().fg(if ratio > 0.2 { Color::Green } else { Color::Yellow }))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Handover timer "),
+        )
+        .gauge_style(Style::default().fg(if ratio > 0.2 {
+            Color::Green
+        } else {
+            Color::Yellow
+        }))
         .ratio(ratio)
         .label(label);
     f.render_widget(gauge, area);
@@ -245,12 +260,18 @@ fn draw_clock_info(f: &mut Frame, area: Rect, st: &Status) {
     let (h, m, s) = (tai / 3600 % 24, tai / 60 % 60, tai % 60);
     let ts_line = if st.ts_hardware {
         Line::from(vec![
-            Span::styled(format!("{:<22}", "Timestamping"), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:<22}", "Timestamping"),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(st.ts_desc.clone(), Style::default().fg(Color::Green)),
         ])
     } else {
         Line::from(vec![
-            Span::styled(format!("{:<22}", "Timestamping"), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:<22}", "Timestamping"),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(
                 format!("⚠ {} — reduced accuracy", st.ts_desc),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -258,7 +279,10 @@ fn draw_clock_info(f: &mut Frame, area: Rect, st: &Status) {
         ])
     };
     let lines = vec![
-        info_line("Clock identity", ptp::fmt_clock_identity(&st.clock_identity)),
+        info_line(
+            "Clock identity",
+            ptp::fmt_clock_identity(&st.clock_identity),
+        ),
         info_line("Domain", st.domain.to_string()),
         info_line(
             "Priority1 / Priority2",
@@ -295,7 +319,10 @@ fn draw_sync_monitor(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonitor) {
     let ns = |v: Option<f64>| v.map_or("-".to_string(), fmt_ns);
     let alarm = |cond: bool, text: String| {
         if cond {
-            Span::styled(text, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            Span::styled(
+                text,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::raw(text)
         }
@@ -327,7 +354,10 @@ fn draw_sync_monitor(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonitor) {
     let lines = vec![
         keyed(
             "State",
-            Span::styled(format!(" {} ", sm.state.label()), sync_state_style(sm.state)),
+            Span::styled(
+                format!(" {} ", sm.state.label()),
+                sync_state_style(sm.state),
+            ),
         ),
         info_line("Grandmaster", gm),
         info_line(
@@ -385,7 +415,11 @@ fn draw_sync_monitor(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonitor) {
         ),
     ];
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Sync monitor ")),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Sync monitor "),
+        ),
         area,
     );
 }
@@ -401,22 +435,34 @@ fn draw_monitor_counters(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonito
     };
     let rows = vec![
         Row::new(vec!["Sync received".to_string(), sm.sync_rx.to_string()]),
-        Row::new(vec!["Follow_Up received".to_string(), sm.follow_up_rx.to_string()]),
+        Row::new(vec![
+            "Follow_Up received".to_string(),
+            sm.follow_up_rx.to_string(),
+        ]),
         Row::new(vec![
             "Sync interval".to_string(),
             sm.sync_interval_ms
                 .map_or("-".into(), |ms| format!("{ms:.1} ms")),
         ]),
-        Row::new(vec!["Syncs missing (seq)".to_string(), sm.missing_syncs.to_string()])
-            .style(warn(sm.missing_syncs)),
+        Row::new(vec![
+            "Syncs missing (seq)".to_string(),
+            sm.missing_syncs.to_string(),
+        ])
+        .style(warn(sm.missing_syncs)),
         Row::new(vec![
             "Follow_Ups missing".to_string(),
             sm.missing_follow_ups.to_string(),
         ])
         .style(warn(sm.missing_follow_ups)),
-        Row::new(vec!["Sync timeouts".to_string(), sm.sync_timeouts.to_string()])
-            .style(warn(sm.sync_timeouts)),
-        Row::new(vec!["Announce received".to_string(), c.announce_rx.to_string()]),
+        Row::new(vec![
+            "Sync timeouts".to_string(),
+            sm.sync_timeouts.to_string(),
+        ])
+        .style(warn(sm.sync_timeouts)),
+        Row::new(vec![
+            "Announce received".to_string(),
+            c.announce_rx.to_string(),
+        ]),
         Row::new(vec![
             "Other ports' Sync".to_string(),
             c.foreign_sync_rx.to_string(),
@@ -425,7 +471,10 @@ fn draw_monitor_counters(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonito
             "Pdelay_Req answered".to_string(),
             format!("{} rx / {} resp", c.pdelay_req_rx, c.pdelay_resp_tx),
         ]),
-        Row::new(vec!["Pdelay_Req sent".to_string(), c.pdelay_req_tx.to_string()]),
+        Row::new(vec![
+            "Pdelay_Req sent".to_string(),
+            c.pdelay_req_tx.to_string(),
+        ]),
     ];
     let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(10)])
         .block(Block::default().borders(Borders::ALL).title(" Traffic "));
@@ -469,13 +518,22 @@ fn draw_counters(f: &mut Frame, area: Rect, st: &Status) {
     let rows = vec![
         Row::new(vec!["Announce sent".to_string(), c.announce_tx.to_string()]),
         Row::new(vec!["Sync sent".to_string(), c.sync_tx.to_string()]),
-        Row::new(vec!["Follow_Up sent".to_string(), c.follow_up_tx.to_string()]),
+        Row::new(vec![
+            "Follow_Up sent".to_string(),
+            c.follow_up_tx.to_string(),
+        ]),
         Row::new(vec![
             "Pdelay_Req answered".to_string(),
             format!("{} rx / {} resp", c.pdelay_req_rx, c.pdelay_resp_tx),
         ]),
-        Row::new(vec!["Pdelay_Req sent".to_string(), c.pdelay_req_tx.to_string()]),
-        Row::new(vec!["Announce received".to_string(), c.announce_rx.to_string()]),
+        Row::new(vec![
+            "Pdelay_Req sent".to_string(),
+            c.pdelay_req_tx.to_string(),
+        ]),
+        Row::new(vec![
+            "Announce received".to_string(),
+            c.announce_rx.to_string(),
+        ]),
         Row::new(vec![
             "Foreign Sync received".to_string(),
             c.foreign_sync_rx.to_string(),
@@ -499,14 +557,8 @@ fn fmt_bps(bps: f64) -> String {
 fn draw_link_health(f: &mut Frame, area: Rect, st: &Status) {
     let l = &st.link;
     let mut lines = vec![
-        info_line(
-            "RX",
-            format!("{} ({} pkt/s)", fmt_bps(l.rx_bps), l.rx_pps),
-        ),
-        info_line(
-            "TX",
-            format!("{} ({} pkt/s)", fmt_bps(l.tx_bps), l.tx_pps),
-        ),
+        info_line("RX", format!("{} ({} pkt/s)", fmt_bps(l.rx_bps), l.rx_pps)),
+        info_line("TX", format!("{} ({} pkt/s)", fmt_bps(l.tx_bps), l.tx_pps)),
     ];
     if l.problems.is_empty() {
         lines.push(Line::from(Span::styled(

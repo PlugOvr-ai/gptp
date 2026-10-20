@@ -224,10 +224,7 @@ impl RawSock {
             match self.recvmsg_ts(&mut buf, libc::MSG_ERRQUEUE) {
                 Ok(Some((n, _pkttype, stamp))) => {
                     // The errqueue message carries the original frame.
-                    if n >= 14 + 32
-                        && buf[14] & 0x0F == want_type
-                        && buf[44..46] == want_seq
-                    {
+                    if n >= 14 + 32 && buf[14] & 0x0F == want_type && buf[44..46] == want_seq {
                         if let Some(stamp) = stamp {
                             return Ok(Some(stamp));
                         }
@@ -376,16 +373,12 @@ fn init_timestamping(fd: RawFd, ifname: &str, force_software: bool) -> (TsMode, 
     };
 
     // Fall back to kernel software timestamps.
-    let sw_flags = SOF_TIMESTAMPING_TX_SOFTWARE
-        | SOF_TIMESTAMPING_RX_SOFTWARE
-        | SOF_TIMESTAMPING_SOFTWARE;
+    let sw_flags =
+        SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
     if set_so_timestamping(fd, sw_flags).is_ok() {
         (TsMode::Software, format!("software — {hw_err}"))
     } else {
-        (
-            TsMode::None,
-            format!("clock sampling only — {hw_err}"),
-        )
+        (TsMode::None, format!("clock sampling only — {hw_err}"))
     }
 }
 
@@ -393,11 +386,15 @@ fn try_enable_hardware(fd: RawFd, ifname: &str) -> Result<PhcClock> {
     // 1. Does the NIC advertise hardware timestamping and a PHC?
     let mut info: EthtoolTsInfo = unsafe { std::mem::zeroed() };
     info.cmd = ETHTOOL_GET_TS_INFO;
-    ifr_ioctl(fd, ifname, SIOCETHTOOL, &mut info as *mut _ as *mut libc::c_char)
-        .context("querying NIC timestamping capabilities")?;
-    let needed = SOF_TIMESTAMPING_TX_HARDWARE
-        | SOF_TIMESTAMPING_RX_HARDWARE
-        | SOF_TIMESTAMPING_RAW_HARDWARE;
+    ifr_ioctl(
+        fd,
+        ifname,
+        SIOCETHTOOL,
+        &mut info as *mut _ as *mut libc::c_char,
+    )
+    .context("querying NIC timestamping capabilities")?;
+    let needed =
+        SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
     if info.so_timestamping & needed != needed {
         bail!("NIC reports no hardware timestamping support");
     }
@@ -443,9 +440,7 @@ fn try_enable_hardware(fd: RawFd, ifname: &str) -> Result<PhcClock> {
     // 3. Request hardware stamps on this socket and open the PHC.
     set_so_timestamping(
         fd,
-        SOF_TIMESTAMPING_TX_HARDWARE
-            | SOF_TIMESTAMPING_RX_HARDWARE
-            | SOF_TIMESTAMPING_RAW_HARDWARE,
+        SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE,
     )
     .context("enabling SO_TIMESTAMPING")?;
     PhcClock::open(info.phc_index)

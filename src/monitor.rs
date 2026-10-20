@@ -79,13 +79,26 @@ impl Thresholds {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Anomaly {
-    Step { size_ns: f64 },
-    Spike { residual_ns: f64 },
-    FreqChange { from_ppb: f64, to_ppb: f64 },
-    Unstable { rms_ns: f64 },
-    Stable { rms_ns: f64 },
+    Step {
+        size_ns: f64,
+    },
+    Spike {
+        residual_ns: f64,
+    },
+    FreqChange {
+        from_ppb: f64,
+        to_ppb: f64,
+    },
+    Unstable {
+        rms_ns: f64,
+    },
+    Stable {
+        rms_ns: f64,
+    },
     /// Too many consecutive samples off the model; it was discarded.
-    Relearn { outliers: usize },
+    Relearn {
+        outliers: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -520,7 +533,8 @@ pub fn run(
                         last_seq = Some(seq);
                         if sync_lost {
                             sync_lost = false;
-                            let gap = last_sync_at.map_or(0, |t| rx_at.duration_since(t).as_millis());
+                            let gap =
+                                last_sync_at.map_or(0, |t| rx_at.duration_since(t).as_millis());
                             st.log(format!("Sync resumed after {gap} ms"));
                         }
                         last_sync_at = Some(rx_at);
@@ -536,8 +550,14 @@ pub fn run(
                             pending = Some(p);
                         } else {
                             sample(
-                                p, origin, 0, &pdelay, &mut analyzer, &state,
-                                &mut last_spike_log, &mut spikes_unlogged,
+                                p,
+                                origin,
+                                0,
+                                &pdelay,
+                                &mut analyzer,
+                                &state,
+                                &mut last_spike_log,
+                                &mut spikes_unlogged,
                             );
                         }
                     }
@@ -571,8 +591,14 @@ pub fn run(
                         if pending.as_ref().is_some_and(|p| p.seq == seq) {
                             let p = pending.take().unwrap();
                             sample(
-                                p, precise_origin, correction_ns, &pdelay, &mut analyzer,
-                                &state, &mut last_spike_log, &mut spikes_unlogged,
+                                p,
+                                precise_origin,
+                                correction_ns,
+                                &pdelay,
+                                &mut analyzer,
+                                &state,
+                                &mut last_spike_log,
+                                &mut spikes_unlogged,
                             );
                         }
                     }
@@ -602,7 +628,9 @@ pub fn run(
         sm.rms_ns = analyzer.rms_ns();
         sm.state = if selected.is_none() {
             SyncState::NoMaster
-        } else if sync_lost || last_sync_at.is_none_or(|t| now.duration_since(t) > Duration::from_secs(3)) {
+        } else if sync_lost
+            || last_sync_at.is_none_or(|t| now.duration_since(t) > Duration::from_secs(3))
+        {
             SyncState::SyncLost
         } else if !analyzer.ready() {
             SyncState::Learning
@@ -628,9 +656,8 @@ fn sample(
 ) {
     let correction = p.correction_ns + fup_correction_ns;
     // Master time at our receive instant.
-    let master_ns = origin.to_ns()
-        + correction as i128
-        + pdelay.link_delay_ns.unwrap_or(0.0).round() as i128;
+    let master_ns =
+        origin.to_ns() + correction as i128 + pdelay.link_delay_ns.unwrap_or(0.0).round() as i128;
     let anomalies = analyzer.add(p.local_ns, master_ns - p.local_ns);
 
     let mut st = state.lock().unwrap();
@@ -662,7 +689,10 @@ fn sample(
                 Anomaly::Step { size_ns } => {
                     sm.steps += 1;
                     sm.last_step_ns = Some(size_ns);
-                    logs.push(format!("ALARM: master time STEP {} (GM {gm})", fmt_ns(size_ns)));
+                    logs.push(format!(
+                        "ALARM: master time STEP {} (GM {gm})",
+                        fmt_ns(size_ns)
+                    ));
                 }
                 Anomaly::Spike { residual_ns } => {
                     sm.spikes += 1;
@@ -779,7 +809,13 @@ mod tests {
         let mut a = Analyzer::new(TH);
         // GM jumps by ~56 years (e.g. a master that lost its time).
         let years: i128 = 56 * 365 * 86_400 * 1_000_000_000;
-        let ev = feed(&mut a, 0, 300, -800.0, |i| if i >= 100 { -years } else { 0 });
+        let ev = feed(
+            &mut a,
+            0,
+            300,
+            -800.0,
+            |i| if i >= 100 { -years } else { 0 },
+        );
         assert_eq!(ev.len(), 1, "{ev:?}");
         assert!(matches!(ev[0].1, Anomaly::Step { .. }));
         assert!(a.last_residual.unwrap().abs() < 10.0);
@@ -811,7 +847,8 @@ mod tests {
             (local - t0) * 2_000 / 1_000_000_000
         });
         assert!(
-            ev.iter().any(|(_, e)| matches!(e, Anomaly::FreqChange { .. })),
+            ev.iter()
+                .any(|(_, e)| matches!(e, Anomaly::FreqChange { .. })),
             "{ev:?}"
         );
         assert!((a.drift_ppb().unwrap() - 2_000.0).abs() < 50.0);
@@ -822,11 +859,24 @@ mod tests {
         let mut a = Analyzer::new(TH);
         feed(&mut a, 0, 100, 0.0, |_| 0);
         // ±600 ns alternating noise: RMS 600 > 250 but each sample within 1 µs.
-        let ev = feed(&mut a, 100, 100, 0.0, |i| if i % 2 == 0 { 600 } else { -600 });
-        assert!(ev.iter().any(|(_, e)| matches!(e, Anomaly::Unstable { .. })), "{ev:?}");
+        let ev = feed(
+            &mut a,
+            100,
+            100,
+            0.0,
+            |i| if i % 2 == 0 { 600 } else { -600 },
+        );
+        assert!(
+            ev.iter()
+                .any(|(_, e)| matches!(e, Anomaly::Unstable { .. })),
+            "{ev:?}"
+        );
         assert!(a.unstable());
         let ev = feed(&mut a, 200, 100, 0.0, |_| 0);
-        assert!(ev.iter().any(|(_, e)| matches!(e, Anomaly::Stable { .. })), "{ev:?}");
+        assert!(
+            ev.iter().any(|(_, e)| matches!(e, Anomaly::Stable { .. })),
+            "{ev:?}"
+        );
     }
 
     #[test]
@@ -835,7 +885,10 @@ mod tests {
         feed(&mut a, 0, 100, 0.0, |_| 0);
         // Wildly alternating garbage, then a clean master 5 s off.
         let ev = feed(&mut a, 100, 20, 0.0, |i| (i % 3 + 1) * 400_000_000);
-        assert!(ev.iter().any(|(_, e)| matches!(e, Anomaly::Relearn { .. })), "{ev:?}");
+        assert!(
+            ev.iter().any(|(_, e)| matches!(e, Anomaly::Relearn { .. })),
+            "{ev:?}"
+        );
         let ev = feed(&mut a, 120, 100, 300.0, |_| 5_000_000_000);
         assert!(ev.is_empty(), "{ev:?}");
         assert!(a.ready() && a.last_residual.unwrap().abs() < 10.0);

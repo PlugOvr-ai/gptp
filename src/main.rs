@@ -108,8 +108,14 @@ fn main() -> Result<()> {
 
 fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Result<()> {
     unsafe {
-        libc::signal(libc::SIGINT, on_signal as usize);
-        libc::signal(libc::SIGTERM, on_signal as usize);
+        libc::signal(
+            libc::SIGINT,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
     }
     let mut printed_events = 0usize;
     while RUNNING.load(Ordering::SeqCst) {
@@ -126,11 +132,7 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
                 Role::Passive => "PASSIVE",
                 Role::Monitor => "MONITOR",
             };
-            let ts = if st.ts_hardware {
-                "hw"
-            } else {
-                "SW-ONLY(!)"
-            };
+            let ts = if st.ts_hardware { "hw" } else { "SW-ONLY(!)" };
             if let Some(sm) = &st.sync {
                 let ns = |v: Option<f64>| v.map_or("-".into(), monitor::fmt_ns);
                 println!(
@@ -138,7 +140,8 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
                      drift={} steps={} spikes={} freq_changes={} relearns={} gm_changes={} \
                      sync_timeouts={} missing_syncs={} missing_fups={}",
                     sm.state.label(),
-                    sm.gm.map_or("-".into(), |g| ptp::fmt_clock_identity(&g.gm_identity)),
+                    sm.gm
+                        .map_or("-".into(), |g| ptp::fmt_clock_identity(&g.gm_identity)),
                     ns(sm.offset_to_system_ns),
                     ns(sm.residual_ns),
                     ns(sm.rms_ns),
@@ -171,12 +174,10 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
                 println!(
                     "node: {} name={} mac={} rtt={} avg={} jitter={} loss={}/{} via={}",
                     n.ip.map_or("-".into(), |i| i.to_string()),
-                    n.name
-                        .as_ref()
-                        .map_or("-".into(), |(name, src)| format!(
-                            "\"{name}\"({})",
-                            src.label()
-                        )),
+                    n.name.as_ref().map_or("-".into(), |(name, src)| format!(
+                        "\"{name}\"({})",
+                        src.label()
+                    )),
                     inventory::fmt_mac(&n.mac),
                     us(n.rtt_last_us),
                     us(n.rtt_avg_us),
