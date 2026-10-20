@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/PlugOvr-ai/gptp/actions/workflows/ci.yml/badge.svg)](https://github.com/PlugOvr-ai/gptp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/PlugOvr-ai/gptp)](https://github.com/PlugOvr-ai/gptp/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
 A Rust gPTP (IEEE 802.1AS) grandmaster for replacing the Elproma NTS Pico3
 mini time server in our ADAS vehicles with e.g. a Raspberry Pi. It serves
@@ -337,3 +338,15 @@ restart the service, so a reinstall picks up new code and arguments.
 All of these use software timestamping (veth has no PHC), so they verify
 behavior, not nanosecond accuracy — that needs the real NIC. The frames
 decode cleanly in `tcpdump -v` / Wireshark.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in this work, as defined in the
+Apache-2.0 license, shall be dual licensed as above, without any additional
+terms or conditions.

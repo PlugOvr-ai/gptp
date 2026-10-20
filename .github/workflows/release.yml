@@ -58,7 +58,7 @@ jobs:
       - name: Package archive
         run: |
           mkdir -p dist staging
-          cp target/${{ matrix.target }}/release/gptp-gm README.md staging/
+          cp target/${{ matrix.target }}/release/gptp-gm README.md LICENSE-APACHE LICENSE-MIT staging/
           tar -czf dist/gptp-gm-${{ matrix.target }}.tar.gz -C staging .
 
       - uses: actions/upload-artifact@v4
