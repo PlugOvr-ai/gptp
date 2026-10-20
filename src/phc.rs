@@ -79,14 +79,21 @@ impl PhcClock {
     pub fn sample_offset_pair(&self) -> Option<(i128, i128)> {
         // Preferred: hardware cross-timestamp.
         let mut precise: PtpSysOffsetPrecise = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(self.fd(), PTP_SYS_OFFSET_PRECISE, &mut precise) } == 0 {
+        if unsafe {
+            libc::ioctl(
+                self.fd(),
+                PTP_SYS_OFFSET_PRECISE as libc::Ioctl,
+                &mut precise,
+            )
+        } == 0
+        {
             return Some((precise.device.to_ns(), precise.sys_realtime.to_ns()));
         }
 
         // Fallback: sys/phc/sys triplets; take the pair with the smallest window.
         let mut off: PtpSysOffset = unsafe { std::mem::zeroed() };
         off.n_samples = 5;
-        if unsafe { libc::ioctl(self.fd(), PTP_SYS_OFFSET, &mut off) } != 0 {
+        if unsafe { libc::ioctl(self.fd(), PTP_SYS_OFFSET as libc::Ioctl, &mut off) } != 0 {
             let _ = io::Error::last_os_error();
             return None;
         }

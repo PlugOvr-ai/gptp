@@ -288,7 +288,7 @@ impl RawSock {
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = ctrl.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = std::mem::size_of_val(&ctrl);
+        msg.msg_controllen = std::mem::size_of_val(&ctrl) as _;
 
         let rc = unsafe { libc::recvmsg(self.fd, &mut msg, flags | libc::MSG_DONTWAIT) };
         if rc < 0 {
@@ -474,7 +474,7 @@ fn ifr_ioctl(
         *dst = *src as libc::c_char;
     }
     req.ifr_ifru.ifru_data = data;
-    let rc = unsafe { libc::ioctl(fd, request, &mut req) };
+    let rc = unsafe { libc::ioctl(fd, request as libc::Ioctl, &mut req) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -486,7 +486,7 @@ fn read_mac(fd: RawFd, ifname: &str) -> Result<[u8; 6]> {
     for (dst, src) in req.ifr_name.iter_mut().zip(ifname.as_bytes()) {
         *dst = *src as libc::c_char;
     }
-    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR, &mut req) };
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR as libc::Ioctl, &mut req) };
     if rc < 0 {
         return Err(io::Error::last_os_error())
             .with_context(|| format!("reading MAC address of {ifname}"));

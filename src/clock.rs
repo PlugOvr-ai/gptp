@@ -13,6 +13,8 @@ use crate::ptp::Timestamp;
 pub struct TaiClock {
     offset_secs: i64,
     kernel_tai: bool,
+    /// Deliberate error added to the served time (--time-error), ns.
+    error_ns: i128,
 }
 
 impl TaiClock {
@@ -28,7 +30,15 @@ impl TaiClock {
                 utc_offset as i64
             },
             kernel_tai,
+            error_ns: 0,
         }
+    }
+
+    /// Serve time deliberately off by `secs` (fault injection for testing
+    /// monitors and switches; independent of the host's TAI configuration).
+    pub fn with_error(mut self, secs: f64) -> Self {
+        self.error_ns = (secs * 1e9).round() as i128;
+        self
     }
 
     pub fn now(&self) -> Timestamp {
@@ -37,13 +47,12 @@ impl TaiClock {
 
     /// Convert a CLOCK_REALTIME-based timestamp (e.g. a kernel software
     /// packet timestamp) to the PTP timescale.
-    pub fn realtime_to_tai(&self, mut t: Timestamp) -> Timestamp {
-        t.secs = t.secs.wrapping_add_signed(self.offset_secs);
-        t
+    pub fn realtime_to_tai(&self, t: Timestamp) -> Timestamp {
+        self.realtime_ns_to_tai(t.to_ns())
     }
 
     pub fn realtime_ns_to_tai(&self, ns: i128) -> Timestamp {
-        Timestamp::from_ns(ns + self.offset_secs as i128 * 1_000_000_000)
+        Timestamp::from_ns(ns + self.offset_secs as i128 * 1_000_000_000 + self.error_ns)
     }
 
     pub fn utc_offset(&self) -> i16 {

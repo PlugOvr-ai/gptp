@@ -15,8 +15,8 @@ slave monitor without hardware and for injecting faults on purpose:
 - **gm** — the Raspberry Pi grandmaster. Extra options via `GM_ARGS`,
   e.g. `GM_ARGS="--handover 1" docker compose … up`.
 - **gm-backup** — stands in for the switch's own grandmaster: lower
-  priority, and its time is deliberately 1 s off (`--utc-offset 38`) so a
-  failover is visible as a time step.
+  priority, and its time is deliberately 1 s off (`--time-error 1`, a
+  hidden fault-injection option) so a failover is visible as a time step.
 - **switch** — bridges its two ports at layer 2 (forwarding the gPTP
   multicast). `tc netem` on its port toward the sensors delays frames
   *between* the GM's transmit timestamp and the monitor's receive

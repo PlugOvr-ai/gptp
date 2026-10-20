@@ -50,7 +50,7 @@ fn main() -> Result<()> {
 
     let sock = net::RawSock::open(&cfg.interface, cfg.force_sw_timestamps)?;
     let our_mac = sock.mac;
-    let clock = clock::TaiClock::new(cfg.utc_offset);
+    let clock = clock::TaiClock::new(cfg.utc_offset).with_error(cfg.time_error);
     let state = Arc::new(Mutex::new(Status::new(cfg.interface.clone())));
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let inv_quit = Arc::new(AtomicBool::new(false));

@@ -798,7 +798,7 @@ fn if_ipv4(fd: RawFd, ifname: &str) -> Option<Ipv4Addr> {
     for (dst, src) in req.ifr_name.iter_mut().zip(ifname.as_bytes()) {
         *dst = *src as libc::c_char;
     }
-    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFADDR, &mut req) };
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFADDR as libc::Ioctl, &mut req) };
     if rc < 0 {
         return None;
     }

@@ -91,7 +91,7 @@ ip link set lo up
 echo "== 1. GM handover with time step, observed by the monitor"
 setup_bridge A C M
 run "$OUT/a.log" vethA --handover 0.1
-run "$OUT/c.log" vethC --priority1 200 --utc-offset 40
+run "$OUT/c.log" vethC --priority1 200 --time-error 3
 run "$OUT/m.log" vethM --monitor --capture-dir "$OUT/cap1"
 sleep 22
 stop_all

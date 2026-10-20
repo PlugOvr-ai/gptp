@@ -9,6 +9,7 @@ name: gptp-lab
 
 x-node: &node
   image: gptp-lab
+  pull_policy: never # built locally by the fwd-mask service
   cap_add: [NET_ADMIN, NET_RAW]
   init: true
   depends_on:
@@ -50,6 +51,7 @@ services:
   # The automotive Ethernet switch: an L2 bridge between both networks.
   switch:
     image: gptp-lab
+    pull_policy: never
     cap_add: [NET_ADMIN]
     init: true
     networks: [gm_side, sensor_side]
@@ -71,11 +73,12 @@ services:
       GM_ARGS: ${GM_ARGS:-}
 
   # Stand-in for the switch's own grandmaster: priority1 200, and its time
-  # is 1 s off (--utc-offset 38), so a failover shows up as a time step.
+  # is deliberately 1 s off (--time-error 1), so a failover shows up as a
+  # time step.
   gm-backup:
     <<: *node
     networks: [gm_side]
-    command: gptp-gm eth0 --no-tui --no-inventory --priority1 200 --utc-offset 38
+    command: gptp-gm eth0 --no-tui --no-inventory --priority1 200 --time-error 1
 
   # The slave monitor on the sensor side, headless; JSONL metrics and CSV
   # captures go to the "out" volume (lab/run.sh copies them to lab/out/).

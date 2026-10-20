@@ -89,6 +89,11 @@ pub struct Config {
     #[arg(long)]
     pub force_sw_timestamps: bool,
 
+    /// Fault injection for tests: serve time this many seconds off
+    /// (fractions allowed, negative = behind)
+    #[arg(long, value_name = "SECONDS", default_value_t = 0.0, hide = true)]
+    pub time_error: f64,
+
     /// Actively ARP-sweep this subnet (e.g. 10.0.0.0/24, max /22) to find
     /// nodes that never talk on their own
     #[arg(long, value_name = "CIDR")]
