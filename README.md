@@ -1,5 +1,8 @@
 # gptp-gm — gPTP grandmaster with timed handover
 
+[![CI](https://github.com/PlugOvr-ai/gptp/actions/workflows/ci.yml/badge.svg)](https://github.com/PlugOvr-ai/gptp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/PlugOvr-ai/gptp)](https://github.com/PlugOvr-ai/gptp/releases/latest)
+
 A Rust gPTP (IEEE 802.1AS) grandmaster for replacing the Elproma NTS Pico3
 mini time server in our ADAS vehicles with e.g. a Raspberry Pi. It serves
 time on one Ethernet interface so that all other devices in the network take
