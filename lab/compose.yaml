@@ -1,0 +1,99 @@
+# gPTP lab: separate containers for grandmasters, an L2 switch, and the
+# slave monitor, wired like the vehicle network. See lab/README.md.
+#
+#   docker compose -f lab/compose.yaml up -d --build
+#   docker compose -f lab/compose.yaml logs -f monitor
+#   lab/run.sh            # scripted fault scenarios with checks
+
+name: gptp-lab
+
+x-node: &node
+  image: gptp-lab
+  cap_add: [NET_ADMIN, NET_RAW]
+  init: true
+  depends_on:
+    switch:
+      condition: service_healthy
+
+volumes:
+  out:
+
+networks:
+  gm_side:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: gptplab-gm
+    ipam:
+      config: [{ subnet: 10.77.1.0/24 }]
+  sensor_side:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: gptplab-sn
+    ipam:
+      config: [{ subnet: 10.77.2.0/24 }]
+
+services:
+  # One-shot helper on the host: Docker's bridges drop the gPTP multicast
+  # (link-local 01:80:C2:00:00:0E) unless group_fwd_mask allows it.
+  fwd-mask:
+    image: gptp-lab
+    build:
+      context: ..
+      dockerfile: lab/Dockerfile
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    command:
+      - sh
+      - -c
+      - for b in gptplab-gm gptplab-sn; do ip link set $$b type bridge group_fwd_mask 0x4000; done
+
+  # The automotive Ethernet switch: an L2 bridge between both networks.
+  switch:
+    image: gptp-lab
+    cap_add: [NET_ADMIN]
+    init: true
+    networks: [gm_side, sensor_side]
+    command: [lab-switch]
+    depends_on:
+      fwd-mask:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, test, -f, /run/lab/ready]
+      interval: 1s
+      retries: 30
+
+  # The Pi grandmaster (priority1 1). GM_ARGS adds options, e.g. --handover 1
+  gm:
+    <<: *node
+    networks: [gm_side]
+    command: sh -c "exec gptp-gm eth0 --no-tui $${GM_ARGS:-}"
+    environment:
+      GM_ARGS: ${GM_ARGS:-}
+
+  # Stand-in for the switch's own grandmaster: priority1 200, and its time
+  # is 1 s off (--utc-offset 38), so a failover shows up as a time step.
+  gm-backup:
+    <<: *node
+    networks: [gm_side]
+    command: gptp-gm eth0 --no-tui --no-inventory --priority1 200 --utc-offset 38
+
+  # The slave monitor on the sensor side, headless; JSONL metrics and CSV
+  # captures go to the "out" volume (lab/run.sh copies them to lab/out/).
+  monitor:
+    <<: *node
+    networks: [sensor_side]
+    command: >
+      gptp-gm eth0 --monitor --no-tui
+      --log-metrics /out/metrics.jsonl --capture-dir /out/captures
+    volumes:
+      - out:/out
+
+  # Interactive monitor TUI:
+  #   docker compose -f lab/compose.yaml run --rm monitor-tui
+  monitor-tui:
+    <<: *node
+    profiles: [tui]
+    networks: [sensor_side]
+    tty: true
+    stdin_open: true
+    command: gptp-gm eth0 --monitor

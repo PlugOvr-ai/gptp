@@ -278,40 +278,25 @@ restarts the service, so a reinstall picks up new code and arguments.
 
 ## Testing without hardware
 
-Unit tests cover message encode/decode and the BMCA ordering (`cargo test`).
-A full two-instance integration test runs in an unprivileged user namespace
-against a veth pair — instance A as forced GM with a 5 s handover, instance B
-simulating the switch with priority1 200:
+- **Unit tests** (`cargo test`): message encode/decode, BMCA ordering, the
+  monitor's step/spike/ramp/jitter/relearn/hold classification, the
+  burst diagnostics and captures, JSON metrics, TUI rendering.
+- **Integration test** (`scripts/integration-test.sh [binary]`): real
+  processes in a throwaway network namespace (root, or unprivileged via a
+  user namespace) on veth pairs and a Linux bridge — GM handover with a
+  +3 s time step observed by the monitor, and a netem jitter burst that the
+  monitor must attribute to path delay.
+- **Docker lab** (`lab/`, see [lab/README.md](lab/README.md)): separate
+  containers for the grandmaster, a backup GM, an L2 "automotive switch"
+  and the monitor; `lab/run.sh` injects jitter on the switch, fails and
+  restores the GM, and checks what the monitor reports. Also the place to
+  experiment by hand (`docker compose -f lab/compose.yaml …`, TUI included).
+- **CI** (`.github/workflows/ci.yml`, every push/PR): rustfmt, clippy
+  `-D warnings`, shellcheck; unit + integration tests and a release build
+  natively on **x86_64 and aarch64** (Ubuntu 22.04 runners, so the binaries
+  also run on Raspberry Pi OS Bookworm) with the binaries as downloadable
+  artifacts; and the Docker lab.
 
-```sh
-unshare -rn bash -c '
-  ip link add vethA type veth peer name vethB
-  ip link set vethA up; ip link set vethB up
-  ./target/release/gptp-gm vethA --no-tui --handover 0.08 &
-  ./target/release/gptp-gm vethB --no-tui --priority1 200 &
-  sleep 10; kill -INT %1 %2'
-```
-
-Expected: A announces/syncs and hands over after ~5 s, B reports A as a
-foreign master that outranks it, and both measure the peer link delay. The
-frames decode cleanly in `tcpdump -v` / Wireshark.
-
-Monitor mode across a GM change with a time jump: two GMs and a monitor on
-a Linux bridge (which must be told to forward the gPTP multicast); GM C runs
-3 s off via `--utc-offset`:
-
-```sh
-unshare -rn bash -c '
-  ip link add br0 type bridge group_fwd_mask 0x4000
-  for x in A C M; do ip link add veth$x type veth peer name p$x
-    ip link set p$x master br0; ip link set p$x up; ip link set veth$x up; done
-  ip link set br0 up
-  ./target/release/gptp-gm vethA --no-tui --no-inventory --handover 0.1 &
-  ./target/release/gptp-gm vethC --no-tui --no-inventory --priority1 200 --utc-offset 40 &
-  ./target/release/gptp-gm vethM --no-tui --no-inventory --monitor &
-  sleep 16; kill -INT %1 %2 %3'
-```
-
-Expected from the monitor: following A, then `Sync stopped` at the
-handover, `grandmaster changed`, `Sync resumed`, and
-`master time STEP +3.000000 s`.
+All of these use software timestamping (veth has no PHC), so they verify
+behavior, not nanosecond accuracy — that needs the real NIC. The frames
+decode cleanly in `tcpdump -v` / Wireshark.
