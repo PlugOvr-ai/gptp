@@ -186,6 +186,11 @@ impl Diag {
         self.short.clear();
     }
 
+    /// Peak jitter level of the current burst, ns.
+    pub fn burst_level(&self) -> Option<f64> {
+        self.burst.as_ref().map(|b| b.peak_rms)
+    }
+
     /// Seconds since the current burst started.
     pub fn burst_age(&self) -> Option<f64> {
         self.burst.as_ref().map(|b| wall_now() - b.started)

@@ -135,8 +135,9 @@ pub struct Analyzer {
     ref_drift: Option<f64>,
     /// Samples to wait before the drift reference is (re)taken.
     freq_settle: usize,
-    /// Model frozen (jitter burst): measure against it, do not learn.
-    hold: bool,
+    /// Model frozen during a jitter burst, with the burst's jitter level:
+    /// measure against the model, do not learn.
+    hold: Option<f64>,
     since_freq_check: usize,
     unstable: bool,
     /// Consecutive samples outside the model.
@@ -157,7 +158,7 @@ impl Analyzer {
             fit: None,
             ref_drift: None,
             freq_settle: 0,
-            hold: false,
+            hold: None,
             since_freq_check: 0,
             unstable: false,
             outliers: 0,
@@ -182,12 +183,15 @@ impl Analyzer {
     /// are measured against it but not learned from, so the model is intact
     /// when the disturbance ends. Steps are still detected, with a stricter
     /// agreement rule that random jitter practically never meets.
-    pub fn set_hold(&mut self, hold: bool) {
-        self.hold = hold;
+    /// `level` is the burst's jitter level: during the hold a step must
+    /// clearly exceed it, so samples of a noisy burst that happen to agree
+    /// are not taken for one. A smaller real step shows up after the burst.
+    pub fn set_hold(&mut self, level: Option<f64>) {
+        self.hold = level;
     }
 
     pub fn holding(&self) -> bool {
-        self.hold
+        self.hold.is_some()
     }
 
     pub fn ready(&self) -> bool {
@@ -234,10 +238,10 @@ impl Analyzer {
         let r = y_raw as f64 - pred;
         self.last_error = Some(r);
 
-        if self.hold {
-            if r.abs() <= self.th.jump_ns {
+        if let Some(level) = self.hold {
+            if r.abs() <= self.th.jump_ns.max(4.0 * level) {
                 self.suspects.clear();
-                self.last_residual = Some(r);
+                self.last_residual = (r.abs() <= self.th.jump_ns).then_some(r);
                 return out;
             }
             let tight = self.th.jitter_ns();
@@ -833,7 +837,7 @@ fn sample(
     if hold_expired {
         analyzer.reset();
     }
-    analyzer.set_hold(hold);
+    analyzer.set_hold(diag.burst_level().filter(|_| hold));
     let anomalies = analyzer.add(p.local_ns, master_ns - p.local_ns);
 
     let mut st = state.lock().unwrap();
@@ -1159,17 +1163,21 @@ mod tests {
     fn hold_keeps_model_through_jitter_and_still_sees_steps() {
         let mut a = Analyzer::new(TH);
         feed(&mut a, 0, 100, 500.0, |_| 0);
-        a.set_hold(true);
+        a.set_hold(Some(1_500.0));
         // ±2 µs uniform-ish jitter, around a 2 µs extra delay: all outside
         // the 1 µs jump threshold, never three within 250 ns of each other.
         let ev = feed(&mut a, 100, 40, 500.0, |i| -2_000 - (i * 977 % 2_000));
         assert!(ev.is_empty(), "{ev:?}");
+        // Disturbed samples that agree but stay within 4x the burst level
+        // are not a step.
+        let ev = feed(&mut a, 140, 6, 500.0, |_| -5_500);
+        assert!(ev.is_empty(), "{ev:?}");
         // A real step during the hold is still found.
-        let ev = feed(&mut a, 140, 10, 500.0, |_| 80_000);
+        let ev = feed(&mut a, 146, 10, 500.0, |_| 80_000);
         assert!(matches!(ev[..], [(_, Anomaly::Step { .. })]), "{ev:?}");
-        a.set_hold(false);
+        a.set_hold(None);
         // Model intact: clean samples (with the step) fit immediately.
-        let ev = feed(&mut a, 150, 50, 500.0, |_| 80_000);
+        let ev = feed(&mut a, 156, 50, 500.0, |_| 80_000);
         assert!(ev.is_empty(), "{ev:?}");
         assert!(a.last_residual.unwrap().abs() < 10.0);
     }
