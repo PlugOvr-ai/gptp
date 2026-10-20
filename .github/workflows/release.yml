@@ -1,0 +1,122 @@
+name: Release
+
+# Push a tag like `v0.2.0` to publish a release with static binaries and the
+# one-line installer. Published only when the full CI passed.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.2.0); created from the selected branch if missing"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # PCs, servers, VMs
+          - x86_64-unknown-linux-musl
+          # Raspberry Pi 3/4/5 (64 bit OS), CM4/CM5, ARM boards
+          - aarch64-unknown-linux-musl
+          # Raspberry Pi 2/3/4 (32 bit OS)
+          - armv7-unknown-linux-musleabihf
+          # Raspberry Pi Zero / 1
+          - arm-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Set version from tag
+        run: |
+          version="${TAG#v}"
+          sed -i "0,/^version = .*/s//version = \"$version\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
+      - name: Build (fully static, runs on any Linux distribution)
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package archive
+        run: |
+          mkdir -p dist staging
+          cp target/${{ matrix.target }}/release/gptp-gm README.md staging/
+          tar -czf dist/gptp-gm-${{ matrix.target }}.tar.gz -C staging .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: [ci, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          cp ../install.sh .
+          for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done
+          sha256sum -- *.tar.gz install.sh > SHA256SUMS
+          ls -l
+
+      - name: Release notes
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          base="https://github.com/$REPO/releases/download/$TAG"
+          cat > notes.md <<NOTES
+          ## Install
+
+          **Raspberry Pi or any Linux machine** (x86_64, ARM64, ARMv7, ARMv6; static binary, no dependencies):
+
+          \`\`\`sh
+          curl -fsSL $base/install.sh | sudo sh
+          \`\`\`
+
+          Install and start as a service in one step:
+
+          \`\`\`sh
+          # grandmaster, hands over to the switch after 15 minutes
+          curl -fsSL $base/install.sh | sudo sh -s -- eth0 --handover 15
+          # slave monitor with capture files
+          curl -fsSL $base/install.sh | sudo sh -s -- eth0 --monitor --capture-dir /var/log/gptp/captures
+          \`\`\`
+
+          Verify downloads with \`SHA256SUMS\`.
+          NOTES
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --title "gptp-gm $TAG" \
+            --notes-file notes.md \
+            --target "$GITHUB_SHA" \
+            --generate-notes

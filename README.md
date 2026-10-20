@@ -149,16 +149,49 @@ automotive Ethernet switch after a configurable number of minutes.
   latency lines) — use this for a systemd service. ALARM events appear in
   both the TUI event log and the headless output.
 
-## Build
+## Install
+
+On the Raspberry Pi (or any Linux machine — x86_64, ARM64, ARMv7, ARMv6;
+static binary, no dependencies):
+
+```sh
+curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.sh | sudo sh
+```
+
+To install and start it as a systemd service in one step, pass the
+interface and the `gptp-gm` options:
+
+```sh
+# grandmaster, hands over to the switch after 15 minutes
+curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.sh | sudo sh -s -- eth0 --handover 15
+# slave monitor with metrics and capture files
+curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.sh | sudo sh -s -- eth0 --monitor \
+    --log-metrics /var/log/gptp/monitor.jsonl --capture-dir /var/log/gptp/captures
+```
+
+The installer picks the binary for the CPU, verifies its SHA-256, and
+installs it to `/usr/local/bin/gptp-gm`. Run it again without arguments to
+update — installed services are restarted on the new version.
+`--uninstall [gm|monitor]` removes the service(s), and the binary once no
+service uses it. **Behind a proxy** it uses `https_proxy`/`http_proxy`, and
+since `sudo` drops your environment it also checks `/etc/environment`,
+`/etc/profile.d`, apt's and dnf/yum's proxy settings and the GNOME proxy
+setting of the user who ran `sudo`. Environment overrides:
+`GPTP_VERSION=v0.2.0` (pin a release), `GPTP_BIN_DIR`, `GPTP_DOWNLOAD_URL`
+(mirror). Releases are published by pushing a `v*` tag
+(`.github/workflows/release.yml`, after the full CI passed).
+
+## Build from source
 
 ```sh
 cargo build --release            # on the Pi itself
-# or cross-compile from a PC:
-cargo build --release --target aarch64-unknown-linux-gnu
+# or static binaries for any Linux, e.g. the Pi, from a PC (needs cross):
+cross build --release --target aarch64-unknown-linux-musl     # 64-bit Pi OS
+cross build --release --target armv7-unknown-linux-musleabihf # 32-bit Pi OS
 ```
 
 The binary needs raw-socket capability, plus `CAP_NET_ADMIN` to enable NIC
-hardware timestamping:
+hardware timestamping. To run it without sudo:
 
 ```sh
 sudo setcap 'cap_net_raw,cap_net_admin+ep' target/release/gptp-gm
@@ -208,10 +241,11 @@ Selected options (see `--help` for all):
 
 ## Run as a systemd service
 
-`scripts/install-service.sh` builds the release binary if needed, installs it
-to `/usr/local/bin/gptp-gm`, and generates + enables a hardened systemd unit
-(capabilities bounded to `CAP_NET_RAW` + `CAP_NET_ADMIN`, filesystem
-protections, headless mode, restart on failure). The first argument is the
+The installer (above) sets up a hardened systemd unit (capabilities
+bounded to `CAP_NET_RAW` + `CAP_NET_ADMIN`, filesystem protections,
+headless mode, restart on failure). From a source checkout,
+`scripts/install-service.sh` does the same with a freshly built binary
+(it builds, then runs `install.sh` with it). The first argument is the
 interface; everything after it is passed through to `gptp-gm`:
 
 ```sh
@@ -233,8 +267,8 @@ journalctl -fu gptp-monitor
 sudo ./scripts/install-service.sh --uninstall monitor   # or: gm
 ```
 
-The script always rebuilds (incrementally) before installing, and
-restarts the service, so a reinstall picks up new code and arguments.
+The script always rebuilds (incrementally) before installing, and both
+restart the service, so a reinstall picks up new code and arguments.
 
 ## Time and timestamping notes
 
