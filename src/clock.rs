@@ -55,6 +55,11 @@ impl TaiClock {
         Timestamp::from_ns(ns + self.offset_secs as i128 * 1_000_000_000 + self.error_ns)
     }
 
+    /// Inverse of `realtime_ns_to_tai`: the CLOCK_REALTIME reading, ns.
+    pub fn tai_to_realtime_ns(&self, t: Timestamp) -> i128 {
+        t.to_ns() - self.offset_secs as i128 * 1_000_000_000 - self.error_ns
+    }
+
     pub fn utc_offset(&self) -> i16 {
         self.offset_secs as i16
     }

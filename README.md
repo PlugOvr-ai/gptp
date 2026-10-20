@@ -76,7 +76,8 @@ master's time for jumps and instability instead.
 - **Slave monitor mode** (`--monitor`): instead of serving time, act as a
   passive gPTP slave — follow the best master on the link (BMCA over the
   received Announces, 1.5 s settle at startup) and watch its time. No clock
-  is adjusted. Each Sync/Follow_Up gives one sample of *master time − local
+  is adjusted unless `--time-sync builtin` (below). Each Sync/Follow_Up
+  gives one sample of *master time − local
   time* against a free-running local timebase (raw PHC with hardware
   timestamps, `CLOCK_MONOTONIC_RAW` otherwise — so NTP/chrony slewing the
   system clock never looks like a master problem). A robust (Theil–Sen)
@@ -141,6 +142,57 @@ master's time for jumps and instability instead.
   The peer-delay responder and initiator stay active — a bridge only sends
   Sync to asCapable ports. Status lines, events and the JSONL metrics
   (`"sync"` object) cover the monitor too.
+
+  **Listen-only** (`--listen-only`, automatic when `ptp4l` is running or
+  with `--time-sync linuxptp`): the monitor sends nothing at all. Two gPTP
+  stacks on one port both answer the switch's peer-delay requests; the
+  switch then treats the link as not asCapable and **stops sending Sync**,
+  and ptp4l goes FAULTY with "rogue peer delay response". The NIC's
+  timestamping configuration is also left alone when it already stamps
+  PTP frames.
+- **Time sync on the slave** (`--monitor --time-sync MODE`): keep this
+  machine's clocks on the master's time.
+  - **`builtin`** — gptp-gm does what ptp4l + phc2sys do, in one process.
+    With hardware timestamps it disciplines the receiving **NIC hardware
+    clock** (PHC) to the master directly; the **system clock** (in UTC) and
+    further NIC clocks (`--sync-phc <iface>`, repeatable — e.g. a second
+    port whose clock timestamps sensor data) follow it via kernel
+    cross-timestamps. Without hardware timestamps it disciplines the
+    system clock directly. Each clock has a PI servo (linuxptp's gains,
+    scaled to the Sync interval); it steps at start, when the monitor
+    classifies a master time step, and beyond 128 ms. Spikes and jitter
+    bursts are not used (holdover), and a master time before 2020 or after
+    2100 is never followed. The kernel gets the TAI offset and the
+    "synchronized" status, so `timedatectl` reports a synchronized clock.
+    The monitor keeps measuring against the NIC clock's *reconstructed
+    free-running* time — every adjustment is kept in a ledger — so its
+    jump/jitter analysis stays exact while the clock is steered. Pauses
+    (with an ALARM) while another time daemon runs.
+  - **`linuxptp`** — for machines whose NIC clocks are best kept by
+    linuxptp (e.g. NVIDIA DRIVE platforms). gptp-gm checks the units set up
+    by `--setup-time-sync linuxptp` and alarms when the system clock is far
+    off the master's UTC (whole TAI−UTC seconds point to a system clock on
+    TAI or a master announcing a wrong UTC offset); it runs listen-only.
+
+  **UTC offset**: PTP time is TAI, the system clock UTC; TAI − UTC = 37 s
+  since 2017 (10 s in 1972 + 27 leap seconds; leap seconds end by 2035).
+  The master's announced offset is used if marked valid and plausible,
+  otherwise `--utc-offset` (37). Our grandmaster now also marks its
+  announced offset valid.
+
+  **Setup** (`--setup-time-sync MODE [--sync-phc …] [--dry-run]`, as root,
+  one-shot): disables conflicting time services (systemd-timesyncd,
+  chrony, ntpd, other ptp4l/phc2sys/timemaster units — masked ones are left
+  alone) and records them; for `linuxptp` it also writes
+  `/etc/linuxptp/gptp-gm-<iface>.cfg` (802.1AS: L2, P2P, transportSpecific
+  1, hardware timestamping where the NIC has a PHC, explicit `utc_offset`,
+  own management sockets) and the units `gptp-ptp4l-<iface>`,
+  `gptp-phc2sys-<iface>-sysclock` (explicit `-O -37`, so a master that
+  announces 0 cannot put the system clock on TAI) and
+  `gptp-phc2sys-<iface>-<nic>`. `--dry-run` prints every file and
+  `systemctl` command without changing anything; `--remove-time-sync`
+  undoes it all and re-enables what was disabled. The installer runs this
+  for you (below).
 - `--no-tui` runs headless and prints status lines (including per-node
   latency lines) — use this for a systemd service. ALARM events appear in
   both the TUI event log and the headless output.
@@ -163,7 +215,17 @@ curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.s
 # slave monitor with metrics and capture files
 curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.sh | sudo sh -s -- eth0 --monitor \
     --log-metrics /var/log/gptp/monitor.jsonl --capture-dir /var/log/gptp/captures
+# slave that keeps this machine's clocks in sync itself (Pi-class machines)
+curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.sh | sudo sh -s -- eth0 --monitor --time-sync builtin
+# multi-NIC machines: set up ptp4l + phc2sys, monitor listen-only beside it
+curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.sh | sudo sh -s -- mgbe0_0 --monitor \
+    --time-sync linuxptp --sync-phc mgbe3_0
 ```
+
+With `--time-sync` the installer runs `--setup-time-sync` (disabling
+conflicting time services, recorded) and gives the service
+`CAP_SYS_TIME` for `builtin`; `--uninstall` undoes the setup and
+re-enables the disabled services.
 
 The installer picks the binary for the CPU, verifies its SHA-256, and
 installs it to `/usr/local/bin/gptp-gm`. Run it again without arguments to
@@ -222,6 +284,12 @@ Selected options (see `--help` for all):
 | `--jump-threshold <ns>` | 1000 / 250000 | monitor: spike/step threshold (HW / SW timestamps) |
 | `--freq-threshold <ppb>` | 100 / 5000 | monitor: frequency-change threshold (HW / SW) |
 | `--capture-dir <dir>` | off | monitor: per-Sync CSV around every alarm |
+| `--listen-only` | auto | monitor: send nothing (automatic when ptp4l runs) |
+| `--time-sync <builtin\|linuxptp>` | off | monitor: keep this machine's clocks on the master |
+| `--sync-phc <iface>` | — | also sync this NIC's hardware clock (repeatable) |
+| `--setup-time-sync <mode>` | — | one-shot system setup for the mode, then exit (root) |
+| `--remove-time-sync` | — | undo the setup, restore disabled services |
+| `--dry-run` | off | with setup/remove: print the changes only |
 | `--priority1 <n>` | 1 | grandmasterPriority1, lower wins the BMCA |
 | `--priority2 <n>` | 1 | grandmasterPriority2 |
 | `--clock-class <n>` | 248 | advertised clockClass |

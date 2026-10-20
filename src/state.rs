@@ -90,6 +90,15 @@ pub struct SyncMonitor {
     pub correction_ns: Option<i64>,
     /// Recent |residual| values for the sparkline, ns, newest last.
     pub history: VecDeque<f64>,
+    /// Sending nothing (another gPTP stack such as ptp4l serves the port).
+    pub listen_only: bool,
+    pub time_sync: Option<crate::config::TimeSync>,
+    /// Clocks kept in sync by the built-in servo.
+    pub clocks: Vec<crate::clocksync::ClockView>,
+    /// linuxptp units set up by --setup-time-sync and their state.
+    pub linuxptp_status: Option<String>,
+    /// UTC offset the followed master announces, and whether it is valid.
+    pub master_utc_offset: Option<(i32, bool)>,
 }
 
 impl Default for SyncMonitor {
@@ -122,6 +131,11 @@ impl Default for SyncMonitor {
             offset_to_system_ns: None,
             correction_ns: None,
             history: VecDeque::new(),
+            listen_only: false,
+            time_sync: None,
+            clocks: Vec::new(),
+            linuxptp_status: None,
+            master_utc_offset: None,
         }
     }
 }

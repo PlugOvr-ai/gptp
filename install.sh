@@ -12,6 +12,18 @@
 #                                                                        # slave monitor: gptp-monitor.service
 #   curl -fsSL .../install.sh | sudo sh -s -- --uninstall [gm|monitor]   # remove service(s); binary when unused
 #
+# Slave monitor that also keeps this machine's time in sync with the master:
+#
+#   ... | sudo sh -s -- eth0 --monitor --time-sync builtin [--sync-phc eth1]
+#        gptp-gm disciplines the NIC hardware clock, the system clock and
+#        further NIC clocks itself (replaces ptp4l + phc2sys)
+#   ... | sudo sh -s -- mgbe0_0 --monitor --time-sync linuxptp [--sync-phc mgbe3_0]
+#        sets up ptp4l + phc2sys (needs linuxptp installed); gptp-gm
+#        monitors listen-only beside it
+#
+# Both disable conflicting time services (systemd-timesyncd, chrony, ntpd,
+# other ptp4l/phc2sys); --uninstall restores them.
+#
 # Running it again without arguments updates the binary and restarts the
 # installed services.
 #
@@ -52,6 +64,13 @@ if [ "${1:-}" = "--uninstall" ]; then
         all) remove="gptp-gm gptp-monitor" ;;
         *) die "--uninstall takes gm, monitor, or nothing" ;;
     esac
+    case " $remove " in
+        *" gptp-monitor "*)
+            if [ -e /etc/gptp-gm/time-sync.state ] && [ -x "$BIN" ]; then
+                $SUDO "$BIN" --remove-time-sync || say "warning: undoing the time sync setup failed"
+            fi
+            ;;
+    esac
     for svc in $remove; do
         if [ -e "$(unit_path "$svc")" ]; then
             $SUDO systemctl disable --now "$svc" 2>/dev/null || true
@@ -80,19 +99,51 @@ fi
 MONITOR=0
 METRICS_FILE=""
 CAPTURE_DIR=""
+TIME_SYNC=""
+SYNC_PHCS=""
+SETUP_EXTRA=""
 prev=""
 for arg in "$@"; do
     case "$prev" in
         --log-metrics) METRICS_FILE="$arg" ;;
         --capture-dir) CAPTURE_DIR="$arg" ;;
+        --time-sync) TIME_SYNC="$arg" ;;
+        --sync-phc) SYNC_PHCS="$SYNC_PHCS $arg" ;;
+        --utc-offset | --neighbor-prop-delay-thresh) SETUP_EXTRA="$SETUP_EXTRA $prev $arg" ;;
     esac
     case "$arg" in
         --monitor) MONITOR=1 ;;
         --log-metrics=*) METRICS_FILE="${arg#--log-metrics=}" ;;
         --capture-dir=*) CAPTURE_DIR="${arg#--capture-dir=}" ;;
+        --time-sync=*) TIME_SYNC="${arg#--time-sync=}" ;;
+        --sync-phc=*) SYNC_PHCS="$SYNC_PHCS ${arg#--sync-phc=}" ;;
+        --utc-offset=* | --neighbor-prop-delay-thresh=*) SETUP_EXTRA="$SETUP_EXTRA $arg" ;;
         *" "*) die "arguments with spaces are not supported in the service command line: $arg" ;;
     esac
     prev="$arg"
+done
+case "$TIME_SYNC" in
+    "") ;;
+    servo) TIME_SYNC=builtin ;;
+    builtin | linuxptp) ;;
+    *) die "--time-sync takes builtin or linuxptp, got $TIME_SYNC" ;;
+esac
+[ -z "$TIME_SYNC" ] || [ "$MONITOR" -eq 1 ] || die "--time-sync needs --monitor"
+# The service command line: phc2sys does the --sync-phc work with linuxptp.
+SERVICE_ARGS=""
+skip=0
+for arg in "$@"; do
+    if [ "$skip" -eq 1 ]; then
+        skip=0
+        continue
+    fi
+    if [ "$TIME_SYNC" = linuxptp ]; then
+        case "$arg" in
+            --sync-phc) skip=1 && continue ;;
+            --sync-phc=*) continue ;;
+        esac
+    fi
+    SERVICE_ARGS="$SERVICE_ARGS $arg"
 done
 for path in "$METRICS_FILE" "$CAPTURE_DIR"; do
     case "$path" in
@@ -240,6 +291,16 @@ if [ -z "$IFACE" ]; then
     exit 0
 fi
 
+# --- Time sync (one-shot system configuration) ------------------------------------------------
+if [ -n "$TIME_SYNC" ]; then
+    setup_args=""
+    for phc in $SYNC_PHCS; do setup_args="$setup_args --sync-phc $phc"; done
+    say "Configuring time sync ($TIME_SYNC)..."
+    # shellcheck disable=SC2086
+    $SUDO "$BIN" "$IFACE" --setup-time-sync "$TIME_SYNC" $setup_args $SETUP_EXTRA \
+        || die "time sync setup failed (see above)"
+fi
+
 # --- Service ---------------------------------------------------------------------------------
 if [ "$MONITOR" -eq 1 ]; then
     SERVICE=gptp-monitor OTHER=gptp-gm OTHER_ARG=gm DESCRIPTION="gPTP slave monitor on $IFACE"
@@ -252,6 +313,13 @@ UNIT="$(unit_path "$SERVICE")"
 if grep -qs "^ExecStart=$BIN $IFACE " "$(unit_path "$OTHER")"; then
     say "warning: $OTHER is also installed on $IFACE - both would answer peer delay on the same port; remove one with: --uninstall $OTHER_ARG"
 fi
+
+AFTER_EXTRA=""
+CAPS_EXTRA=""
+case "$TIME_SYNC" in
+    builtin) CAPS_EXTRA=" CAP_SYS_TIME" ;;
+    linuxptp) AFTER_EXTRA=" gptp-ptp4l-$IFACE.service" ;;
+esac
 
 RW_DIRS=""
 [ -z "$METRICS_FILE" ] || RW_DIRS="$(dirname "$METRICS_FILE")"
@@ -267,15 +335,16 @@ $SUDO tee "$UNIT" >/dev/null <<EOF
 [Unit]
 Description=$DESCRIPTION
 Documentation=https://github.com/$REPO
-After=network-online.target sys-subsystem-net-devices-$IFACE.device
+After=network-online.target sys-subsystem-net-devices-$IFACE.device$AFTER_EXTRA
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN $IFACE --no-tui${*:+ $*}
+ExecStart=$BIN $IFACE --no-tui$SERVICE_ARGS
 # Runs as root for /dev/ptp* (PTP hardware clock) access, with capabilities
-# bounded to what raw sockets + NIC timestamping configuration need.
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+# bounded to raw sockets + NIC timestamping configuration (+ setting clocks
+# with --time-sync builtin).
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN$CAPS_EXTRA
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

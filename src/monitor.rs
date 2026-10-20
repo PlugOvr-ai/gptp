@@ -32,9 +32,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::clock::{stamp_to_local_ns, stamp_to_tai, TaiClock};
-use crate::config::Config;
+use crate::clocksync::{self, Rx, SyncEngine};
+use crate::config::{Config, TimeSync};
 use crate::gm::{log_to_duration, Cmd};
-use crate::net::RawSock;
+use crate::net::{RawSock, RawStamp};
 use crate::pdelay::PeerDelay;
 use crate::ptp::{self, AnnounceData, Msg, MsgBuilder, Timestamp};
 use crate::state::{ForeignMaster, Role, Status, SyncMonitor, SyncState};
@@ -459,6 +460,8 @@ pub fn fmt_ns(ns: f64) -> String {
 struct Candidate {
     port: [u8; 10],
     data: AnnounceData,
+    utc_offset: i16,
+    utc_offset_valid: bool,
     timeout: Duration,
     last_seen: Instant,
     announces: u64,
@@ -467,6 +470,7 @@ struct Candidate {
 struct PendingSync {
     seq: u16,
     rx_at: Instant,
+    stamp: Option<RawStamp>,
     local_ns: i128,
     sys: Timestamp,
     correction_ns: i64,
@@ -502,11 +506,16 @@ pub fn run(
         st.started = start;
         st.log(format!(
             "Started as slave monitor on {} (clock {}) — jump threshold {}, \
-             frequency threshold {:.0} ppb; no clock is adjusted",
-            cfg.interface,
+             frequency threshold {:.0} ppb{}",
+            cfg.iface(),
             ptp::fmt_clock_identity(&clock_identity),
             fmt_ns(th.jump_ns).trim_start_matches('+'),
-            th.freq_ppb
+            th.freq_ppb,
+            match cfg.time_sync {
+                None => "; no clock is adjusted",
+                Some(TimeSync::Builtin) => "; time sync: built-in servo",
+                Some(TimeSync::Linuxptp) => "; time sync: linuxptp",
+            }
         ));
         if hw {
             st.log(format!("Hardware timestamping active: {}", sock.ts_desc()));
@@ -518,6 +527,58 @@ pub fn run(
             ));
         }
     }
+
+    // Another gPTP stack on this port (ptp4l) answers peer delay already: a
+    // second responder makes the bridge treat the link as not asCapable and
+    // stop sending Sync, and makes ptp4l report rogue responses.
+    let ptp4l = clocksync::running(&["ptp4l"]);
+    let listen_only =
+        cfg.listen_only || cfg.time_sync == Some(TimeSync::Linuxptp) || !ptp4l.is_empty();
+    {
+        let mut st = state.lock().unwrap();
+        if listen_only {
+            let why = if cfg.time_sync == Some(TimeSync::Linuxptp) {
+                "linuxptp serves this port".to_string()
+            } else if let Some((_, pid)) = ptp4l.first() {
+                format!("ptp4l is running (pid {pid}) and serves the port")
+            } else {
+                "--listen-only".to_string()
+            };
+            st.log(format!(
+                "Listen-only: sending nothing, no peer delay ({why}); the offset to the system \
+                 clock excludes the link delay"
+            ));
+        }
+        st.sync.as_mut().unwrap().listen_only = listen_only;
+        st.sync.as_mut().unwrap().time_sync = cfg.time_sync;
+    }
+    let mut engine = if cfg.time_sync == Some(TimeSync::Builtin) {
+        match setup_engine(&cfg, &sock) {
+            Ok(e) => {
+                state.lock().unwrap().log(format!(
+                    "Time sync: {}",
+                    e.views()
+                        .iter()
+                        .map(|v| v.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" → ")
+                ));
+                Some(e)
+            }
+            Err(e) => {
+                state
+                    .lock()
+                    .unwrap()
+                    .log(format!("ALARM: time sync not started — {e:#}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut conflicts_checked: Option<Instant> = None;
+    let mut linuxptp_checked: Option<Instant> = None;
+    let mut utc_logged: Option<(i32, bool)> = None;
 
     let mut pdelay = PeerDelay::new(start);
     let mut analyzer = Analyzer::new(th);
@@ -545,7 +606,96 @@ pub fn run(
         }
 
         let now = Instant::now();
-        pdelay.tick(now, &builder, &sock, &clock, &state);
+        if !listen_only {
+            pdelay.tick(now, &builder, &sock, &clock, &state);
+        }
+
+        // Other time daemons would fight the servo: pause it while any runs.
+        if let Some(e) = &mut engine {
+            if conflicts_checked.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(30)) {
+                conflicts_checked = Some(now);
+                let found = clocksync::running(clocksync::CONFLICTING_DAEMONS);
+                if !found.is_empty() && !e.disabled() {
+                    let names: Vec<String> = found
+                        .iter()
+                        .map(|(n, p)| format!("{n} (pid {p})"))
+                        .collect();
+                    e.disable(&format!("{} running", names.join(", ")));
+                    state.lock().unwrap().log(format!(
+                        "ALARM: time sync paused — {} would fight over the clocks; stop it or \
+                         run --setup-time-sync builtin once to disable it",
+                        names.join(", ")
+                    ));
+                } else if found.is_empty() && e.disabled() {
+                    e.enable();
+                    state
+                        .lock()
+                        .unwrap()
+                        .log("Time sync resumed: no conflicting time daemon running");
+                }
+            }
+        }
+        if cfg.time_sync == Some(TimeSync::Linuxptp)
+            && linuxptp_checked.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(10))
+        {
+            linuxptp_checked = Some(now);
+            let status = crate::timesync_setup::unit_status();
+            let mut st = state.lock().unwrap();
+            let sm = st.sync.as_mut().unwrap();
+            let failed: Vec<&(String, String)> =
+                status.iter().filter(|(_, s)| s != "active").collect();
+            let line = if status.is_empty() {
+                "no units set up — run --setup-time-sync linuxptp".to_string()
+            } else {
+                status
+                    .iter()
+                    .map(|(u, s)| format!("{u}: {s}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let changed = sm.linuxptp_status.as_deref() != Some(line.as_str());
+            sm.linuxptp_status = Some(line.clone());
+            if changed && (!failed.is_empty() || status.is_empty()) {
+                st.log(format!("ALARM: linuxptp time sync not healthy — {line}"));
+            }
+        }
+
+        // UTC offset: what the followed master announces, if marked valid
+        // and plausible; otherwise the configured value.
+        let utc_now = {
+            let announced = selected
+                .and_then(|s| candidates.iter().find(|c| c.port == s))
+                .map(|c| (c.utc_offset as i32, c.utc_offset_valid));
+            let use_announced = announced.is_some_and(|(o, v)| v && (30..=50).contains(&o));
+            let utc = if use_announced {
+                announced.unwrap().0
+            } else {
+                cfg.utc_offset as i32
+            };
+            if let Some(a) = announced {
+                if utc_logged != Some(a) {
+                    utc_logged = Some(a);
+                    let mut st = state.lock().unwrap();
+                    st.sync.as_mut().unwrap().master_utc_offset = Some(a);
+                    st.log(if use_announced {
+                        format!("Master announces UTC offset {} s (valid)", a.0)
+                    } else {
+                        format!(
+                            "WARNING: master announces UTC offset {} s ({}) — using {} s \
+                             (--utc-offset) to derive UTC",
+                            a.0,
+                            if a.1 {
+                                "implausible"
+                            } else {
+                                "not marked valid"
+                            },
+                            utc
+                        )
+                    });
+                }
+            }
+            utc
+        };
 
         // Master selection: best Announce still within its receipt timeout.
         candidates.retain(|c| now.duration_since(c.last_seen) < c.timeout);
@@ -620,7 +770,7 @@ pub fn run(
                 let Some(msg) = ptp::parse(&rxbuf[..n]) else {
                     continue;
                 };
-                if pdelay.handle(&msg, t_rx, &builder, &sock, &clock, &state) {
+                if !listen_only && pdelay.handle(&msg, t_rx, &builder, &sock, &clock, &state) {
                     continue;
                 }
                 match msg {
@@ -628,6 +778,8 @@ pub fn run(
                         source,
                         log_interval,
                         data,
+                        utc_offset,
+                        utc_offset_valid,
                     } => {
                         if source[..8] == clock_identity[..] {
                             continue;
@@ -648,12 +800,16 @@ pub fn run(
                                     }
                                 }
                                 c.data = data;
+                                c.utc_offset = utc_offset;
+                                c.utc_offset_valid = utc_offset_valid;
                                 c.last_seen = rx_at;
                                 c.announces += 1;
                             }
                             None => candidates.push(Candidate {
                                 port: source,
                                 data,
+                                utc_offset,
+                                utc_offset_valid,
                                 timeout: log_to_duration(log_interval.clamp(-4, 4)) * 3,
                                 last_seen: rx_at,
                                 announces: 1,
@@ -713,7 +869,13 @@ pub fn run(
                         let p = PendingSync {
                             seq,
                             rx_at,
-                            local_ns: stamp_to_local_ns(stamp),
+                            stamp,
+                            // With the NIC clock disciplined, measure against
+                            // its reconstructed free-running time.
+                            local_ns: match (stamp, &engine) {
+                                (Some(s), Some(e)) if s.hardware => e.free_running_ns(s.ts.to_ns()),
+                                _ => stamp_to_local_ns(stamp),
+                            },
                             sys: t_rx,
                             correction_ns,
                         };
@@ -726,10 +888,16 @@ pub fn run(
                                 0,
                                 None,
                                 None,
-                                &pdelay,
-                                &mut analyzer,
-                                &mut diag,
-                                &state,
+                                Ctx {
+                                    link_delay_ns: pdelay.link_delay_ns.filter(|_| !listen_only),
+                                    analyzer: &mut analyzer,
+                                    diag: &mut diag,
+                                    engine: engine.as_mut(),
+                                    utc_offset: utc_now,
+                                    check_system: cfg.time_sync == Some(TimeSync::Linuxptp),
+                                    clock: &clock,
+                                    state: &state,
+                                },
                             );
                         }
                     }
@@ -774,10 +942,16 @@ pub fn run(
                                 correction_ns,
                                 Some(fup_delay_us),
                                 rate_ppb,
-                                &pdelay,
-                                &mut analyzer,
-                                &mut diag,
-                                &state,
+                                Ctx {
+                                    link_delay_ns: pdelay.link_delay_ns.filter(|_| !listen_only),
+                                    analyzer: &mut analyzer,
+                                    diag: &mut diag,
+                                    engine: engine.as_mut(),
+                                    utc_offset: utc_now,
+                                    check_system: cfg.time_sync == Some(TimeSync::Linuxptp),
+                                    clock: &clock,
+                                    state: &state,
+                                },
                             );
                         }
                     }
@@ -794,7 +968,7 @@ pub fn run(
             st.log(l);
         }
         st.tai_now_secs = clock.now().secs;
-        st.link_delay_ns = pdelay.link_delay_ns;
+        st.link_delay_ns = pdelay.link_delay_ns.filter(|_| !listen_only);
         st.foreign_masters = candidates
             .iter()
             .map(|c| ForeignMaster {
@@ -808,6 +982,7 @@ pub fn run(
         sm.master_port = selected;
         sm.gm = selected.and_then(|s| candidates.iter().find(|c| c.port == s).map(|c| c.data));
         sm.drift_ppb = analyzer.drift_ppb();
+        sm.clocks = engine.as_ref().map_or_else(Vec::new, |e| e.views());
         sm.bursts = diag.bursts;
         sm.in_burst = diag.in_burst();
         sm.captures = diag.captures;
@@ -828,23 +1003,47 @@ pub fn run(
     }
 }
 
+/// What `sample` works with besides the measurement itself.
+struct Ctx<'a> {
+    /// None in listen-only mode (we do not measure it).
+    link_delay_ns: Option<f64>,
+    analyzer: &'a mut Analyzer,
+    diag: &'a mut Diag,
+    engine: Option<&'a mut SyncEngine>,
+    /// TAI − UTC used to derive UTC, s.
+    utc_offset: i32,
+    /// Alarm when the system clock is far off the master's UTC (another
+    /// tool keeps it in sync: linuxptp).
+    check_system: bool,
+    clock: &'a TaiClock,
+    state: &'a Arc<Mutex<Status>>,
+}
+
 /// Process one complete Sync (+ Follow_Up) measurement.
-#[allow(clippy::too_many_arguments)]
 fn sample(
     p: PendingSync,
     origin: Timestamp,
     fup_correction_ns: i64,
     fup_delay_us: Option<f64>,
     rate_offset_ppb: Option<f64>,
-    pdelay: &PeerDelay,
-    analyzer: &mut Analyzer,
-    diag: &mut Diag,
-    state: &Arc<Mutex<Status>>,
+    ctx: Ctx,
 ) {
+    let Ctx {
+        link_delay_ns,
+        analyzer,
+        diag,
+        engine,
+        utc_offset,
+        check_system,
+        clock,
+        state,
+    } = ctx;
     let correction = p.correction_ns + fup_correction_ns;
     // Master time at our receive instant.
     let master_ns =
-        origin.to_ns() + correction as i128 + pdelay.link_delay_ns.unwrap_or(0.0).round() as i128;
+        origin.to_ns() + correction as i128 + link_delay_ns.unwrap_or(0.0).round() as i128;
+    let utc_ns = utc_offset as i128 * 1_000_000_000;
+    let system_offset = (master_ns - utc_ns - clock.tai_to_realtime_ns(p.sys)) as f64;
     // Freeze the model during a jitter burst, but not forever: a burst that
     // persists is the new normal and has to be learned.
     let hold = diag.burst_age().is_some_and(|a| a < HOLD_MAX_SECS);
@@ -884,7 +1083,7 @@ fn sample(
         let sm = st.sync.as_mut().unwrap();
         nominal_ns = sm.nominal_interval_ns;
         sm.correction_ns = Some(correction);
-        sm.offset_to_system_ns = Some((master_ns - p.sys.to_ns()) as f64);
+        sm.offset_to_system_ns = Some(system_offset);
         sm.residual_ns = analyzer.last_residual;
         let spikes = anomalies.iter().filter_map(|a| match a {
             Anomaly::Spike { residual_ns } => Some(*residual_ns),
@@ -973,7 +1172,7 @@ fn sample(
                 origin_ns: origin.to_ns(),
                 error_ns: analyzer.last_error,
                 correction_ns: correction,
-                link_delay_ns: pdelay.link_delay_ns,
+                link_delay_ns,
                 fup_delay_us,
                 rate_offset_ppb,
                 rx_bps,
@@ -987,9 +1186,62 @@ fn sample(
     if was_in_burst && !diag.in_burst() {
         analyzer.rebaseline();
     }
+    if let Some(e) = engine {
+        let rx = match p.stamp {
+            Some(s) if s.hardware => Rx::Phc(s.ts.to_ns()),
+            _ => Rx::Realtime(clock.tai_to_realtime_ns(p.sys)),
+        };
+        let stepped = notes.contains(&"step");
+        logs.extend(e.sample(
+            master_ns,
+            rx,
+            utc_offset,
+            analyzer.last_residual.is_some(),
+            analyzer.holding(),
+            stepped,
+        ));
+    }
+    if check_system && system_offset.abs() > 0.5e9 {
+        if let Some(n) = diag.may_log("system-offset") {
+            let secs = (system_offset / 1e9).round();
+            let hint = if (35.0..=40.0).contains(&secs.abs()) {
+                " — a whole TAI−UTC offset: the system clock is set to TAI, or the master \
+                 announces a wrong UTC offset"
+            } else {
+                ""
+            };
+            logs.push(format!(
+                "ALARM: system clock is {} off the master's UTC{hint}{}",
+                fmt_ns(system_offset),
+                if n > 0 {
+                    format!(" (+{n} more)")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    }
     for l in logs {
         st.log(l);
     }
+}
+
+/// The clock chain for --time-sync builtin: the receiving NIC's PHC (with
+/// hardware timestamps), the system clock, and --sync-phc NICs.
+fn setup_engine(cfg: &Config, sock: &RawSock) -> Result<SyncEngine> {
+    use anyhow::Context;
+    let primary = sock
+        .phc()
+        .map(|p| crate::phc::PhcClock::open(p.index).map(|c| (cfg.iface().to_string(), c)))
+        .transpose()?;
+    let mut extras = Vec::new();
+    for iface in &cfg.sync_phc {
+        let index = crate::net::phc_index(iface)?
+            .with_context(|| format!("{iface} has no PTP hardware clock"))?;
+        extras.push((iface.clone(), crate::phc::PhcClock::open(index)?));
+    }
+    let interval = log_to_duration(cfg.log_sync_interval).as_secs_f64();
+    SyncEngine::new(primary, extras, interval).context("opening the clocks for adjustment")
 }
 
 fn fmt_port(p: &[u8; 10]) -> String {

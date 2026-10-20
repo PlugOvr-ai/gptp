@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Row, Sparkline, Table};
 use ratatui::Frame;
 
+use crate::config::TimeSync;
 use crate::gm::Cmd;
 use crate::monitor::fmt_ns;
 use crate::ptp;
@@ -68,6 +69,10 @@ fn draw(f: &mut Frame, st: &Status) {
     if monitor.is_some() {
         constraints.push(Constraint::Length(5));
     }
+    let sync_rows = monitor.map_or(0, time_sync_rows);
+    if sync_rows > 0 {
+        constraints.push(Constraint::Length(sync_rows + 2));
+    }
     constraints.push(Constraint::Min(6));
     constraints.push(Constraint::Length(9));
     constraints.push(Constraint::Length(1));
@@ -87,6 +92,12 @@ fn draw(f: &mut Frame, st: &Status) {
     };
     let mid_area = rows[idx];
     let spark_area = if monitor.is_some() {
+        idx += 1;
+        Some(rows[idx])
+    } else {
+        None
+    };
+    let time_sync_area = if sync_rows > 0 {
         idx += 1;
         Some(rows[idx])
     } else {
@@ -122,6 +133,9 @@ fn draw(f: &mut Frame, st: &Status) {
     draw_link_health(f, mid[2], st);
     if let (Some(area), Some(sm)) = (spark_area, monitor) {
         draw_residual_history(f, area, sm);
+    }
+    if let (Some(area), Some(sm)) = (time_sync_area, monitor) {
+        draw_time_sync(f, area, sm);
     }
     draw_nodes(f, nodes_area, st);
 
@@ -405,9 +419,11 @@ fn draw_sync_monitor(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonitor) {
         keyed("Timestamping", ts_value),
         info_line(
             "Peer link delay",
-            st.link_delay_ns
-                .map(|d| format!("{:.0} ns", d))
-                .unwrap_or_else(|| "no pdelay peer yet".into()),
+            match st.link_delay_ns {
+                Some(d) => format!("{d:.0} ns"),
+                None if sm.listen_only => "not measured (listen-only)".into(),
+                None => "no pdelay peer yet".into(),
+            },
         ),
         info_line(
             "Residence (corr.)",
@@ -420,6 +436,96 @@ fn draw_sync_monitor(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonitor) {
                 .borders(Borders::ALL)
                 .title(" Sync monitor "),
         ),
+        area,
+    );
+}
+
+/// Rows of the time sync panel (0 = no panel).
+fn time_sync_rows(sm: &SyncMonitor) -> u16 {
+    match sm.time_sync {
+        None => 0,
+        Some(TimeSync::Builtin) => sm.clocks.len().max(1) as u16 + 1,
+        Some(TimeSync::Linuxptp) => 2,
+    }
+}
+
+fn draw_time_sync(f: &mut Frame, area: Rect, sm: &SyncMonitor) {
+    let utc = match sm.master_utc_offset {
+        Some((o, true)) => format!("master UTC offset {o} s"),
+        Some((o, false)) => format!("master UTC offset {o} s — not marked valid"),
+        None => "master UTC offset unknown yet".into(),
+    };
+    let state_style = |state: &str| match state {
+        "locked" | "active" => Style::default().fg(Color::Green),
+        "holdover" | "waiting" | "activating" => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    };
+    let mut lines = Vec::new();
+    match sm.time_sync {
+        Some(TimeSync::Builtin) => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{:<34} {:<10} {:>14} {:>14} {:>6}",
+                    "clock", "state", "offset", "frequency", "steps"
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
+            if sm.clocks.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "not running — see the event log",
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            for c in &sm.clocks {
+                let mut spans = vec![
+                    Span::raw(format!("{:<34} ", c.name)),
+                    Span::styled(format!("{:<10}", c.state), state_style(c.state)),
+                    Span::raw(format!(
+                        " {:>14} {:>11.0} ppb {:>6}",
+                        c.offset_ns.map_or("-".into(), fmt_ns),
+                        c.freq_ppb,
+                        c.steps
+                    )),
+                ];
+                if let Some(n) = &c.note {
+                    spans.push(Span::styled(
+                        format!("  {n}"),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        Some(TimeSync::Linuxptp) => {
+            let status = sm
+                .linuxptp_status
+                .clone()
+                .unwrap_or_else(|| "checking…".into());
+            let healthy = status.split(", ").all(|u| u.ends_with(": active"));
+            lines.push(Line::from(vec![
+                Span::styled("units  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    status,
+                    if healthy {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                    },
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "monitor listen-only beside ptp4l; system clock checked against the master's UTC",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        None => {}
+    }
+    let title = match sm.time_sync {
+        Some(TimeSync::Builtin) => format!(" Time sync — built-in servo, {utc} "),
+        _ => format!(" Time sync — linuxptp, {utc} "),
+    };
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
 }
@@ -853,6 +959,16 @@ mod tests {
             ..Default::default()
         };
         sm.history.extend((0..200).map(|i| (i % 17) as f64 * 10.0));
+        sm.time_sync = Some(TimeSync::Builtin);
+        sm.master_utc_offset = Some((37, true));
+        sm.clocks = vec![crate::clocksync::ClockView {
+            name: "NIC clock eth0 (/dev/ptp0)".into(),
+            state: "locked",
+            offset_ns: Some(-12.0),
+            freq_ppb: -4200.0,
+            steps: 1,
+            note: None,
+        }];
         st.sync = Some(sm);
         let mon = render(&st);
         if std::env::var_os("SHOW_TUI").is_some() {
@@ -862,5 +978,7 @@ mod tests {
         assert!(mon.contains("Sync monitor"));
         assert!(mon.contains("+3.000000 s"));
         assert!(!mon.contains("toggle GM"));
+        assert!(mon.contains("Time sync — built-in servo, master UTC offset 37 s"));
+        assert!(mon.contains("NIC clock eth0 (/dev/ptp0)"));
     }
 }

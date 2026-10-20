@@ -15,6 +15,7 @@ pub const MT_ANNOUNCE: u8 = 0xB;
 
 const FLAG_TWO_STEP: u16 = 0x0200;
 const FLAG_PTP_TIMESCALE: u16 = 0x0008;
+const FLAG_UTC_OFFSET_VALID: u16 = 0x0004;
 
 const HDR_LEN: usize = 34;
 
@@ -98,6 +99,10 @@ pub enum Msg {
         source: [u8; 10],
         log_interval: i8,
         data: AnnounceData,
+        /// currentUtcOffset (TAI − UTC, s) and whether the master marks it
+        /// valid (currentUtcOffsetValid flag).
+        utc_offset: i16,
+        utc_offset_valid: bool,
     },
     Sync {
         source: [u8; 10],
@@ -163,6 +168,8 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
             Some(Msg::Announce {
                 source,
                 log_interval,
+                utc_offset: i16::from_be_bytes([buf[44], buf[45]]),
+                utc_offset_valid: flags & FLAG_UTC_OFFSET_VALID != 0,
                 data: AnnounceData {
                     priority1: buf[47],
                     clock_class: buf[48],
@@ -299,7 +306,9 @@ impl MsgBuilder {
         let mut b = self.header(
             MT_ANNOUNCE,
             HDR_LEN + 30 + 12,
-            FLAG_PTP_TIMESCALE,
+            // The UTC offset comes from the kernel or the configured value
+            // (37 s since 2017); slaves use it to derive UTC from PTP time.
+            FLAG_PTP_TIMESCALE | FLAG_UTC_OFFSET_VALID,
             seq,
             5,
             log_announce,
@@ -406,7 +415,14 @@ mod tests {
         assert_eq!(b.len(), 76);
         assert_eq!(b[0], 0x1B); // majorSdoId 1, Announce
         match parse(&b) {
-            Some(Msg::Announce { data, .. }) => {
+            Some(Msg::Announce {
+                data,
+                utc_offset,
+                utc_offset_valid,
+                ..
+            }) => {
+                assert_eq!(utc_offset, 37);
+                assert!(utc_offset_valid);
                 assert_eq!(data.priority1, 1);
                 assert_eq!(data.clock_class, 248);
                 assert_eq!(data.variance, 0x4E5D);

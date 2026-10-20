@@ -735,6 +735,20 @@ fn csv_row(r: &SampleRec) -> String {
     )
 }
 
+/// UTC "YYYY-MM-DD HH:MM:SS" for messages.
+pub fn fmt_utc_date(unix: i64) -> String {
+    let c = fmt_utc_compact(unix as f64);
+    format!(
+        "{}-{}-{} {}:{}:{}",
+        &c[0..4],
+        &c[4..6],
+        &c[6..8],
+        &c[9..11],
+        &c[11..13],
+        &c[13..15]
+    )
+}
+
 /// UTC "YYYYMMDDTHHMMSSZ" for file names.
 fn fmt_utc_compact(unix: f64) -> String {
     let secs = unix as i64;
@@ -1011,6 +1025,7 @@ mod tests {
     #[test]
     fn utc_file_stamp() {
         assert_eq!(fmt_utc_compact(0.0), "19700101T000000Z");
+        assert_eq!(fmt_utc_date(86_400), "1970-01-02 00:00:00");
         assert_eq!(fmt_utc_compact(1_792_498_263.4), "20261020T121103Z");
     }
 }

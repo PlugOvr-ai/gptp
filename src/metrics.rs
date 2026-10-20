@@ -110,6 +110,28 @@ fn snapshot_json(st: &Status) -> String {
             sm.missing_syncs,
             sm.missing_follow_ups,
         ));
+        if !sm.clocks.is_empty() || sm.linuxptp_status.is_some() {
+            s.push_str("\"time_sync\":{\"clocks\":[");
+            for (i, c) in sm.clocks.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!(
+                    "{{\"name\":\"{}\",\"state\":\"{}\",\"offset_ns\":{},\"freq_ppb\":{:.0},\"steps\":{}}}",
+                    esc(&c.name),
+                    c.state,
+                    c.offset_ns.map_or("null".into(), |o| format!("{o:.0}")),
+                    c.freq_ppb,
+                    c.steps
+                ));
+            }
+            s.push_str(&format!(
+                "],\"linuxptp\":{}}},",
+                sm.linuxptp_status
+                    .as_ref()
+                    .map_or("null".into(), |l| format!("\"{}\"", esc(l)))
+            ));
+        }
     }
     let l = &st.link;
     s.push_str(&format!(
@@ -188,7 +210,17 @@ mod tests {
     #[test]
     fn snapshot_is_wellformed_json() {
         let mut st = Status::new("eth0".into());
-        st.sync = Some(crate::state::SyncMonitor::default());
+        let mut sm = crate::state::SyncMonitor::default();
+        sm.clocks.push(crate::clocksync::ClockView {
+            name: "NIC clock \"x\"".into(),
+            state: "locked",
+            offset_ns: Some(-3.0),
+            freq_ppb: 12.0,
+            steps: 1,
+            note: None,
+        });
+        sm.linuxptp_status = Some("gptp-ptp4l-eth0: active".into());
+        st.sync = Some(sm);
         let mut node = NodeInfo::new([2, 0, 0, 0, 0, 9], Instant::now());
         node.ip = Some("10.0.0.2".parse().unwrap());
         node.set_name("na\"me\\x".into(), crate::state::NameSource::Mdns);
@@ -237,6 +269,7 @@ mod tests {
         assert!(!in_str);
         assert!(line.contains("\"rx_crc_errors\""));
         assert!(line.contains("\"sync\":{\"state\":\"no-master\""));
+        assert!(line.contains("\"time_sync\":{\"clocks\":[{\"name\":\"NIC clock \\\"x\\\"\""));
         assert!(line.contains("na\\\"me\\\\x"));
     }
 }

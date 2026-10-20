@@ -1,6 +1,20 @@
 //! Command-line configuration.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// How the slave monitor keeps the Linux system time in sync.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeSync {
+    /// gptp-gm keeps the clocks in sync itself — the receiving NIC's
+    /// hardware clock (with hardware timestamps), the system clock, and
+    /// --sync-phc NICs; replaces ptp4l + phc2sys ("servo" also accepted)
+    #[value(alias = "servo")]
+    Builtin,
+    /// linuxptp (ptp4l + phc2sys, set up with --setup-time-sync) keeps the
+    /// NIC hardware clocks and the system clock in sync; gptp-gm monitors
+    /// listen-only beside it
+    Linuxptp,
+}
 
 /// gPTP (IEEE 802.1AS) grandmaster with timed handover, and slave monitor.
 ///
@@ -8,12 +22,17 @@ use clap::Parser;
 /// answers peer-delay requests. With --handover, announcing stops after the
 /// given number of minutes so the automotive Ethernet switch takes over as GM.
 /// With --monitor, acts as a passive slave instead and reports jumps and
-/// instability in the master's time.
+/// instability in the master's time; --time-sync keeps the system time in
+/// sync with the master.
+///
+/// --setup-time-sync / --remove-time-sync configure the system for that
+/// (one-shot, as root) and exit.
 #[derive(Parser, Clone, Debug)]
 #[command(version, about)]
 pub struct Config {
     /// Network interface to serve gPTP on (e.g. eth0)
-    pub interface: String,
+    #[arg(required_unless_present = "remove_time_sync")]
+    pub interface: Option<String>,
 
     /// Serve time for this many minutes, then hand over to the switch.
     /// Omit to act as grandmaster indefinitely. Fractions allowed (0.5 = 30 s).
@@ -22,7 +41,7 @@ pub struct Config {
 
     /// Slave monitor mode: never announce; follow the best master on the
     /// link and report time steps, spikes, frequency changes, jitter, Sync
-    /// loss and GM changes. No clock is adjusted.
+    /// loss and GM changes. No clock is adjusted unless --time-sync builtin.
     #[arg(long)]
     pub monitor: bool,
 
@@ -42,6 +61,45 @@ pub struct Config {
     /// this directory, for offline analysis
     #[arg(long, value_name = "DIR", requires = "monitor")]
     pub capture_dir: Option<String>,
+
+    /// Monitor: send nothing (no peer delay), only listen. Needed when
+    /// another gPTP stack such as ptp4l serves the same port — two
+    /// responders on one link make the bridge stop sending Sync. Enabled
+    /// automatically when ptp4l is running or with --time-sync linuxptp.
+    #[arg(long, requires = "monitor")]
+    pub listen_only: bool,
+
+    /// Monitor: keep the Linux system time in sync with the master
+    #[arg(long, value_name = "MODE", requires = "monitor")]
+    pub time_sync: Option<TimeSync>,
+
+    /// Configure this system for --time-sync MODE and exit (as root):
+    /// disables conflicting time services (recorded, restored by
+    /// --remove-time-sync); for linuxptp also writes the gPTP ptp4l config
+    /// and ptp4l/phc2sys systemd units for this interface
+    #[arg(long, value_name = "MODE", conflicts_with = "remove_time_sync")]
+    pub setup_time_sync: Option<TimeSync>,
+
+    /// Also keep this NIC's hardware clock in sync, e.g. a second port used
+    /// for sensor timestamps. Repeatable. With --time-sync builtin at runtime,
+    /// with --setup-time-sync linuxptp via phc2sys.
+    #[arg(long, value_name = "IFACE")]
+    pub sync_phc: Vec<String>,
+
+    /// With --setup-time-sync linuxptp: ptp4l neighborPropDelayThresh in ns
+    /// (the link is not used above it; 800 is the 802.1AS default)
+    #[arg(long, value_name = "NS", default_value_t = 800)]
+    pub neighbor_prop_delay_thresh: u32,
+
+    /// Undo --setup-time-sync: stop and remove the units and config it
+    /// created and re-enable the time services it disabled; then exit
+    #[arg(long)]
+    pub remove_time_sync: bool,
+
+    /// With --setup-time-sync / --remove-time-sync: print what would be
+    /// done (files, systemctl commands) without changing anything
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// grandmasterPriority1 — lower wins the BMCA; 1 outranks any default
     /// device (switches/endpoints typically use 246-255)
@@ -116,4 +174,11 @@ pub struct Config {
     /// Run without the TUI and log status lines to stdout instead
     #[arg(long)]
     pub no_tui: bool,
+}
+
+impl Config {
+    /// The network interface; present unless only --remove-time-sync runs.
+    pub fn iface(&self) -> &str {
+        self.interface.as_deref().unwrap_or("")
+    }
 }

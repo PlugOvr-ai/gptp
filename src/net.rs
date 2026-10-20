@@ -29,12 +29,14 @@ const SOF_TIMESTAMPING_RAW_HARDWARE: u32 = 1 << 6;
 
 const SIOCETHTOOL: libc::c_ulong = 0x8946;
 const SIOCSHWTSTAMP: libc::c_ulong = 0x89b0;
+const SIOCGHWTSTAMP: libc::c_ulong = 0x89b1;
 const ETHTOOL_GET_TS_INFO: u32 = 0x41;
 
 const HWTSTAMP_TX_ON: i32 = 1;
 const HWTSTAMP_FILTER_ALL: i32 = 1;
 const HWTSTAMP_FILTER_PTP_V2_L2_EVENT: i32 = 6;
 const HWTSTAMP_FILTER_PTP_V2_EVENT: i32 = 12;
+const HWTSTAMP_FILTER_NTP_ALL: i32 = 15;
 
 #[repr(C)]
 struct EthtoolTsInfo {
@@ -402,13 +404,43 @@ fn try_enable_hardware(fd: RawFd, ifname: &str) -> Result<PhcClock> {
         bail!("NIC has no PTP hardware clock (PHC)");
     }
 
-    // 2. Turn on timestamping in the NIC (needs CAP_NET_ADMIN).
-    let mut last = anyhow::anyhow!("no rx filter accepted");
+    // 2. Turn on timestamping in the NIC (needs CAP_NET_ADMIN) — unless it
+    //    already stamps transmitted frames and received gPTP event frames,
+    //    e.g. set up by a ptp4l on the same port: reconfiguring the NIC
+    //    under another PTP stack could disturb it.
+    let mut current = HwtstampConfig {
+        flags: 0,
+        tx_type: 0,
+        rx_filter: 0,
+    };
+    let already = ifr_ioctl(
+        fd,
+        ifname,
+        SIOCGHWTSTAMP,
+        &mut current as *mut _ as *mut libc::c_char,
+    )
+    .is_ok()
+        && current.tx_type == HWTSTAMP_TX_ON
+        && [
+            HWTSTAMP_FILTER_ALL,
+            HWTSTAMP_FILTER_PTP_V2_L2_EVENT,
+            HWTSTAMP_FILTER_PTP_V2_EVENT,
+            HWTSTAMP_FILTER_NTP_ALL,
+        ]
+        .contains(&current.rx_filter);
+    let mut last = if already {
+        anyhow::anyhow!("ok")
+    } else {
+        anyhow::anyhow!("no rx filter accepted")
+    };
     for rx_filter in [
         HWTSTAMP_FILTER_PTP_V2_L2_EVENT,
         HWTSTAMP_FILTER_PTP_V2_EVENT,
         HWTSTAMP_FILTER_ALL,
     ] {
+        if already {
+            break;
+        }
         let mut cfg = HwtstampConfig {
             flags: 0,
             tx_type: HWTSTAMP_TX_ON,
@@ -444,6 +476,28 @@ fn try_enable_hardware(fd: RawFd, ifname: &str) -> Result<PhcClock> {
     )
     .context("enabling SO_TIMESTAMPING")?;
     PhcClock::open(info.phc_index)
+}
+
+/// The PTP hardware clock index of a NIC (`/dev/ptpN`), if it has one and
+/// supports hardware timestamping. Needs no privileges.
+pub fn phc_index(ifname: &str) -> Result<Option<i32>> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).context("opening control socket");
+    }
+    let mut info: EthtoolTsInfo = unsafe { std::mem::zeroed() };
+    info.cmd = ETHTOOL_GET_TS_INFO;
+    let res = ifr_ioctl(
+        fd,
+        ifname,
+        SIOCETHTOOL,
+        &mut info as *mut _ as *mut libc::c_char,
+    );
+    unsafe { libc::close(fd) };
+    res.with_context(|| format!("querying timestamping capabilities of {ifname}"))?;
+    let needed =
+        SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
+    Ok((info.so_timestamping & needed == needed && info.phc_index >= 0).then_some(info.phc_index))
 }
 
 fn set_so_timestamping(fd: RawFd, flags: u32) -> io::Result<()> {

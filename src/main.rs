@@ -1,4 +1,5 @@
 mod clock;
+mod clocksync;
 mod config;
 mod gm;
 mod inventory;
@@ -13,6 +14,7 @@ mod ptp;
 mod state;
 mod streams;
 mod syncdiag;
+mod timesync_setup;
 mod tui;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +38,21 @@ extern "C" fn on_signal(_: libc::c_int) {
 fn main() -> Result<()> {
     let cfg = Config::parse();
 
+    if cfg.remove_time_sync {
+        return timesync_setup::remove(&cfg);
+    }
+    if let Some(mode) = cfg.setup_time_sync {
+        return timesync_setup::setup(&cfg, mode);
+    }
+    if cfg.dry_run {
+        anyhow::bail!("--dry-run only applies to --setup-time-sync / --remove-time-sync");
+    }
+    if !cfg.sync_phc.is_empty() && cfg.time_sync != Some(config::TimeSync::Builtin) {
+        anyhow::bail!(
+            "--sync-phc needs --time-sync builtin (or --setup-time-sync linuxptp to set up phc2sys)"
+        );
+    }
+
     let scan_subnet = cfg
         .scan_subnet
         .as_deref()
@@ -48,10 +65,10 @@ fn main() -> Result<()> {
         .transpose()?
         .unwrap_or_default();
 
-    let sock = net::RawSock::open(&cfg.interface, cfg.force_sw_timestamps)?;
+    let sock = net::RawSock::open(cfg.iface(), cfg.force_sw_timestamps)?;
     let our_mac = sock.mac;
     let clock = clock::TaiClock::new(cfg.utc_offset).with_error(cfg.time_error);
-    let state = Arc::new(Mutex::new(Status::new(cfg.interface.clone())));
+    let state = Arc::new(Mutex::new(Status::new(cfg.iface().to_string())));
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let inv_quit = Arc::new(AtomicBool::new(false));
 
@@ -67,7 +84,7 @@ fn main() -> Result<()> {
     let inv = if cfg.no_inventory {
         None
     } else {
-        let iface = cfg.interface.clone();
+        let iface = cfg.iface().to_string();
         let state = Arc::clone(&state);
         let quit = Arc::clone(&inv_quit);
         Some(thread::spawn(move || {
@@ -76,7 +93,7 @@ fn main() -> Result<()> {
     };
     let mut aux = Vec::new();
     {
-        let iface = cfg.interface.clone();
+        let iface = cfg.iface().to_string();
         let state = Arc::clone(&state);
         let quit = Arc::clone(&inv_quit);
         aux.push(thread::spawn(move || linkstats::run(iface, state, quit)));
@@ -157,6 +174,22 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
                     sm.missing_syncs,
                     sm.missing_follow_ups,
                 );
+                for c in &sm.clocks {
+                    println!(
+                        "clock: \"{}\" state={} offset={} freq={:+.0}ppb steps={}{}",
+                        c.name,
+                        c.state,
+                        ns(c.offset_ns),
+                        c.freq_ppb,
+                        c.steps,
+                        c.note
+                            .as_ref()
+                            .map_or(String::new(), |n| format!(" note=\"{n}\""))
+                    );
+                }
+                if let Some(l) = &sm.linuxptp_status {
+                    println!("linuxptp: {l}");
+                }
             }
             println!(
                 "status: {role} ts={ts} announce_tx={} sync_tx={} pdelay_answered={} \

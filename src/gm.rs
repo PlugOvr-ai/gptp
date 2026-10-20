@@ -70,7 +70,7 @@ pub fn run(
         st.handover_minutes = cfg.handover;
         st.log(format!(
             "Started as grandmaster on {} (clock {})",
-            cfg.interface,
+            cfg.iface(),
             ptp::fmt_clock_identity(&clock_identity)
         ));
         if let Some(m) = cfg.handover {
