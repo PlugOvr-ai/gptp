@@ -2,6 +2,7 @@
 //! neighbor, and two-step responder so the neighbor keeps us asCapable.
 //! Shared by the grandmaster and the slave monitor.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,11 @@ use crate::ptp::{Msg, MsgBuilder, Timestamp};
 use crate::state::Status;
 
 const INTERVAL: Duration = Duration::from_secs(1);
+/// Measurements in the median filter. A cable's delay is constant, so a
+/// long median costs nothing and ignores disturbances of up to ~7 s
+/// (queueing, asymmetric congestion) entirely — an average would smear
+/// them into the time offset for many seconds afterwards.
+const MEDIAN_OF: usize = 15;
 
 struct Pending {
     seq: u16,
@@ -28,7 +34,8 @@ pub struct PeerDelay {
     seq: u16,
     pub next: Instant,
     pending: Option<Pending>,
-    /// Smoothed link delay, ns.
+    recent: VecDeque<f64>,
+    /// Median of the recent measurements, ns.
     pub link_delay_ns: Option<f64>,
 }
 
@@ -38,6 +45,7 @@ impl PeerDelay {
             seq: 0,
             next: start + Duration::from_millis(200),
             pending: None,
+            recent: VecDeque::with_capacity(MEDIAN_OF + 1),
             link_delay_ns: None,
         }
     }
@@ -151,8 +159,13 @@ impl PeerDelay {
                     let roundtrip = t4.to_ns() - p.t1.to_ns();
                     let delay = (roundtrip - turnaround) as f64 / 2.0
                         - (p.resp_correction_ns + correction_ns) as f64;
-                    let ewma = self.link_delay_ns.map_or(delay, |e| e * 0.8 + delay * 0.2);
-                    self.link_delay_ns = Some(ewma);
+                    self.recent.push_back(delay);
+                    if self.recent.len() > MEDIAN_OF {
+                        self.recent.pop_front();
+                    }
+                    let mut sorted: Vec<f64> = self.recent.iter().copied().collect();
+                    sorted.sort_by(f64::total_cmp);
+                    self.link_delay_ns = Some(sorted[sorted.len() / 2]);
                 }
             }
             _ => return false,

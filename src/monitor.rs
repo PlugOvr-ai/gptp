@@ -3,12 +3,13 @@
 //!
 //! No clock is adjusted. Each Sync/Follow_Up pair yields one sample of
 //! "master time − local time" against a free-running local timebase (raw
-//! PHC, or CLOCK_MONOTONIC_RAW for software stamps). A linear fit over the
-//! last few seconds models the frequency difference; anything the model
-//! does not predict is what we report:
+//! PHC, or CLOCK_MONOTONIC_RAW for software stamps). A robust (Theil–Sen)
+//! line fit over the last few seconds models the frequency difference, so
+//! a share of disturbed samples cannot bend it; anything the model does
+//! not predict is what we report:
 //!
-//! - **step**: two consecutive samples off the prediction by the same
-//!   amount — the master's time jumped (GM change, GM stepped its clock,
+//! - **step**: three consecutive samples off the prediction by the same
+//!   amount (two can agree by chance under heavy path-delay jitter) — the master's time jumped (GM change, GM stepped its clock,
 //!   switch servo reset, ...). The model is re-based and keeps running.
 //! - **spike**: a single sample off the prediction — a delayed/corrupted
 //!   timestamp, typically queueing in a bridge.
@@ -37,19 +38,22 @@ use crate::net::RawSock;
 use crate::pdelay::PeerDelay;
 use crate::ptp::{self, AnnounceData, Msg, MsgBuilder, Timestamp};
 use crate::state::{ForeignMaster, Role, Status, SyncMonitor, SyncState};
+use crate::syncdiag::{self, Diag, SampleRec};
 
 /// Samples in the drift-model window (8 s at the default 8 Sync/s).
 const WINDOW: usize = 64;
 /// Samples needed before the model predicts anything.
 const MIN_SAMPLES: usize = 8;
+/// Consistent out-of-model samples that make a step.
+const STEP_SAMPLES: usize = 3;
 /// Re-check the drift for frequency changes every this many samples.
 const FREQ_CHECK_EVERY: usize = 8;
 const HISTORY: usize = 240;
+/// Longest time the model stays frozen during a jitter burst, s.
+const HOLD_MAX_SECS: f64 = 30.0;
 /// Wait this long for Announces before choosing the first master, so we do
 /// not briefly follow whichever master happened to announce first.
 const SELECTION_SETTLE: Duration = Duration::from_millis(1500);
-/// Minimum spacing of spike events in the log (they are all counted).
-const SPIKE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Thresholds {
@@ -124,16 +128,23 @@ pub struct Analyzer {
     base: Option<(i128, i128)>,
     /// (local s, offset ns) relative to `base`.
     window: VecDeque<(f64, f64)>,
-    /// First out-of-model sample, held back until the next one tells
-    /// whether it was a spike or a step: (x, raw relative offset, residual).
-    suspect: Option<(f64, i128, f64)>,
+    /// Out-of-model samples held back until it is clear whether they are
+    /// spikes or a step: (x, raw relative offset, residual).
+    suspects: Vec<(f64, i128, f64)>,
     fit: Option<Fit>,
     ref_drift: Option<f64>,
+    /// Samples to wait before the drift reference is (re)taken.
+    freq_settle: usize,
+    /// Model frozen (jitter burst): measure against it, do not learn.
+    hold: bool,
     since_freq_check: usize,
     unstable: bool,
     /// Consecutive samples outside the model.
     outliers: usize,
     pub last_residual: Option<f64>,
+    /// Deviation of the last sample from the model, however it was
+    /// classified (None while learning).
+    pub last_error: Option<f64>,
 }
 
 impl Analyzer {
@@ -142,19 +153,41 @@ impl Analyzer {
             th,
             base: None,
             window: VecDeque::with_capacity(WINDOW + 1),
-            suspect: None,
+            suspects: Vec::new(),
             fit: None,
             ref_drift: None,
+            freq_settle: 0,
+            hold: false,
             since_freq_check: 0,
             unstable: false,
             outliers: 0,
             last_residual: None,
+            last_error: None,
         }
     }
 
     /// Forget everything and start learning from the next sample.
     pub fn reset(&mut self) {
         *self = Analyzer::new(self.th);
+    }
+
+    /// Re-take the drift reference once the whole window has been replaced
+    /// — after a disturbance its samples may have biased the slope.
+    pub fn rebaseline(&mut self) {
+        self.ref_drift = None;
+        self.freq_settle = WINDOW;
+    }
+
+    /// Freeze the model while samples are disturbed (jitter burst): they
+    /// are measured against it but not learned from, so the model is intact
+    /// when the disturbance ends. Steps are still detected, with a stricter
+    /// agreement rule that random jitter practically never meets.
+    pub fn set_hold(&mut self, hold: bool) {
+        self.hold = hold;
+    }
+
+    pub fn holding(&self) -> bool {
+        self.hold
     }
 
     pub fn ready(&self) -> bool {
@@ -194,63 +227,118 @@ impl Analyzer {
             }
             self.push(x, y_raw as f64);
             self.last_residual = None;
+            self.last_error = None;
             return out;
         };
         let pred = fit.predict(x);
         let r = y_raw as f64 - pred;
+        self.last_error = Some(r);
+
+        if self.hold {
+            if r.abs() <= self.th.jump_ns {
+                self.suspects.clear();
+                self.last_residual = Some(r);
+                return out;
+            }
+            let tight = self.th.jitter_ns();
+            if !self.suspects.iter().all(|s| (r - s.2).abs() <= tight) {
+                self.suspects.clear();
+            }
+            self.suspects.push((x, y_raw, r));
+            self.last_residual = None;
+            if self.suspects.len() >= STEP_SAMPLES {
+                out.push(self.apply_step(bx, by, y_raw, pred, r));
+            }
+            return out;
+        }
 
         if r.abs() <= self.th.jump_ns {
-            if let Some((_, _, sr)) = self.suspect.take() {
+            for (_, _, sr) in self.suspects.drain(..) {
                 out.push(Anomaly::Spike { residual_ns: sr });
             }
             self.outliers = 0;
             self.push(x, y_raw as f64);
             self.last_residual = Some(r);
-        } else {
-            match self.suspect.take() {
-                None => {
-                    // Held back: its residual is reported once classified
-                    // (as a spike), or dropped if it turns out to be a step.
-                    self.suspect = Some((x, y_raw, r));
-                    self.last_residual = None;
-                    self.outliers += 1;
-                    return out;
-                }
-                Some((sx, sy, sr)) if (r - sr).abs() <= self.th.jump_ns => {
-                    // Both samples agree: the master's time stepped. Shift
-                    // the offset base by the step (in integer ns, so even a
-                    // jump of years keeps full precision afterwards).
-                    let step = y_raw - pred.round() as i128;
-                    self.base = Some((bx, by + step));
-                    self.push(sx, (sy - step) as f64);
-                    self.push(x, (y_raw - step) as f64);
-                    self.last_residual = Some(r - step as f64);
-                    self.outliers = 0;
-                    out.push(Anomaly::Step {
-                        size_ns: step as f64,
-                    });
-                }
-                Some((_, _, sr)) => {
-                    out.push(Anomaly::Spike { residual_ns: sr });
-                    self.suspect = Some((x, y_raw, r));
-                    self.last_residual = None;
-                    self.outliers += 1;
-                    if self.outliers >= MIN_SAMPLES {
-                        let outliers = self.outliers;
-                        self.reset();
-                        out.push(Anomaly::Relearn { outliers });
-                    }
-                    return out;
-                }
+        } else if self
+            .suspects
+            .iter()
+            .all(|s| (r - s.2).abs() <= self.th.jump_ns)
+        {
+            if self.suspects.len() + 1 < STEP_SAMPLES {
+                // Held back: its residual is reported once classified (as a
+                // spike), or dropped if it turns out to be part of a step.
+                self.suspects.push((x, y_raw, r));
+                self.last_residual = None;
+                self.outliers += 1;
+                return out;
             }
+            // A steady ramp (residuals moving monotonically) is a frequency
+            // change, not a step: accept the samples as they are so the fit
+            // follows, and let the drift check report it.
+            // Smooth: monotonic, roughly equal increments, moving by more
+            // than half the instability level, and the model was calm —
+            // random path-delay jitter does not qualify. Should a noisy
+            // real step ever pass as a ramp, the following samples stay
+            // offset by a constant and are reported as the step.
+            let r0 = self.suspects[0].2;
+            let incs: Vec<f64> = self
+                .suspects
+                .windows(2)
+                .map(|w| w[1].2 - w[0].2)
+                .chain([r - self.suspects.last().unwrap().2])
+                .collect();
+            let monotonic = incs.iter().all(|d| d.signum() == (r - r0).signum());
+            let (lo, hi) = incs.iter().fold((f64::MAX, 0.0f64), |(lo, hi), d| {
+                (lo.min(d.abs()), hi.max(d.abs()))
+            });
+            let smooth = monotonic && lo >= hi / 3.0 && fit.rms < self.th.jitter_ns();
+            if smooth && (r - r0).abs() > self.th.jitter_ns() / 2.0 {
+                for (sx, sy, _) in std::mem::take(&mut self.suspects) {
+                    self.push(sx, sy as f64);
+                }
+                self.push(x, y_raw as f64);
+                // Forget the old slope so the fit follows the new rate now
+                // instead of lagging behind it for a whole window.
+                while self.window.len() > 2 * MIN_SAMPLES {
+                    self.window.pop_front();
+                }
+                self.fit = Some(fit_line(&self.window));
+                self.last_residual = Some(r);
+                self.outliers = 0;
+                return out;
+            }
+            self.suspects.push((x, y_raw, r));
+            out.push(self.apply_step(bx, by, y_raw, pred, r));
+        } else {
+            for (_, _, sr) in self.suspects.drain(..) {
+                out.push(Anomaly::Spike { residual_ns: sr });
+            }
+            self.suspects.push((x, y_raw, r));
+            self.last_residual = None;
+            self.outliers += 1;
+            if self.outliers >= MIN_SAMPLES {
+                let outliers = self.outliers;
+                self.reset();
+                out.push(Anomaly::Relearn { outliers });
+            }
+            return out;
         }
 
         self.since_freq_check += 1;
+        self.freq_settle = self.freq_settle.saturating_sub(1);
         if let Some(fit) = self.fit {
-            if self.window.len() >= WINDOW && self.since_freq_check >= FREQ_CHECK_EVERY {
+            if self.window.len() >= WINDOW
+                && self.freq_settle == 0
+                && self.since_freq_check >= FREQ_CHECK_EVERY
+            {
                 self.since_freq_check = 0;
+                // Residual jitter makes the fitted slope itself uncertain;
+                // only a change well beyond that uncertainty is real.
+                let n = self.window.len() as f64;
+                let span = self.window.back().unwrap().0 - self.window.front().unwrap().0;
+                let slope_sigma = fit.rms / (span.max(1e-3) * (n / 12.0).sqrt());
                 match self.ref_drift {
-                    Some(r) if (fit.b - r).abs() > self.th.freq_ppb => {
+                    Some(r) if (fit.b - r).abs() > self.th.freq_ppb.max(4.0 * slope_sigma) => {
                         out.push(Anomaly::FreqChange {
                             from_ppb: r,
                             to_ppb: fit.b,
@@ -273,6 +361,23 @@ impl Analyzer {
         out
     }
 
+    /// The held suspects (the current sample last) agree: the master's time
+    /// stepped. Shift the offset base by the step (in integer ns, so even a
+    /// jump of years keeps full precision afterwards).
+    fn apply_step(&mut self, bx: i128, by: i128, y_raw: i128, pred: f64, r: f64) -> Anomaly {
+        let step = y_raw - pred.round() as i128;
+        self.base = Some((bx, by + step));
+        for (sx, sy, _) in std::mem::take(&mut self.suspects) {
+            self.push(sx, (sy - step) as f64);
+        }
+        self.last_residual = Some(r - step as f64);
+        self.last_error = self.last_residual;
+        self.outliers = 0;
+        Anomaly::Step {
+            size_ns: step as f64,
+        }
+    }
+
     fn push(&mut self, x: f64, y: f64) {
         self.window.push_back((x, y));
         if self.window.len() > WINDOW {
@@ -282,22 +387,40 @@ impl Analyzer {
     }
 }
 
-/// Least-squares line with RMS residual.
+/// Theil–Sen line fit (median of pairwise slopes, median intercept) with
+/// RMS residual. Up to ~29% of disturbed samples — path-delay jitter that
+/// stayed inside the jump threshold — cannot bias the slope, so the model
+/// recovers within seconds after a disturbance instead of a whole window.
 fn fit_line(pts: &VecDeque<(f64, f64)>) -> Fit {
-    let n = pts.len() as f64;
-    let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
-    let my = pts.iter().map(|p| p.1).sum::<f64>() / n;
-    let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
-    let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
-    let b = if sxx > 0.0 { sxy / sxx } else { 0.0 };
-    let a = my - b * mx;
+    let n = pts.len();
+    let mut slopes = Vec::with_capacity(n * (n - 1) / 2);
+    for i in 0..n {
+        for j in i + 1..n {
+            let dx = pts[j].0 - pts[i].0;
+            if dx > 0.0 {
+                slopes.push((pts[j].1 - pts[i].1) / dx);
+            }
+        }
+    }
+    let b = median(&mut slopes).unwrap_or(0.0);
+    let mut intercepts: Vec<f64> = pts.iter().map(|p| p.1 - b * p.0).collect();
+    let a = median(&mut intercepts).unwrap_or(0.0);
     let rms = (pts
         .iter()
         .map(|p| (p.1 - (a + b * p.0)).powi(2))
         .sum::<f64>()
-        / n)
+        / n as f64)
         .sqrt();
     Fit { a, b, rms }
+}
+
+fn median(v: &mut [f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mid = v.len() / 2;
+    let (_, m, _) = v.select_nth_unstable_by(mid, f64::total_cmp);
+    Some(*m)
 }
 
 /// Human-readable signed nanoseconds.
@@ -324,6 +447,7 @@ struct Candidate {
 
 struct PendingSync {
     seq: u16,
+    rx_at: Instant,
     local_ns: i128,
     sys: Timestamp,
     correction_ns: i64,
@@ -387,13 +511,16 @@ pub fn run(
     let mut sync_interval = Duration::from_millis(125);
     let mut sync_lost = false;
     let mut last_tbi: Option<u16> = None;
-    let mut last_spike_log: Option<Instant> = None;
-    let mut spikes_unlogged = 0u64;
+    let mut diag = Diag::new(th, cfg.capture_dir.clone().map(Into::into));
     let mut rxbuf = [0u8; 1600];
 
     loop {
         while let Ok(cmd) = cmds.try_recv() {
             if let Cmd::Quit = cmd {
+                // The UI is gone by now; report a pending capture directly.
+                if let Some(l) = diag.flush() {
+                    eprintln!("{l}");
+                }
                 return Ok(());
             }
         }
@@ -407,12 +534,18 @@ pub fn run(
             .iter()
             .min_by_key(|c| (c.data.bmca_key(), c.data.steps_removed))
             .map(|c| (c.port, c.data));
-        if best.map(|b| b.0) != selected && now.duration_since(start) >= SELECTION_SETTLE {
+        let changed = match best {
+            // A bridge relaying a new GM keeps its port: compare both.
+            Some((port, data)) => Some(port) != selected || Some(data.gm_identity) != selected_gm,
+            None => selected.is_some(),
+        };
+        if changed && now.duration_since(start) >= SELECTION_SETTLE {
             let mut st = state.lock().unwrap();
             match best {
                 Some((port, data)) => {
                     if selected_gm.is_some_and(|g| g != data.gm_identity) {
                         st.sync.as_mut().unwrap().gm_changes += 1;
+                        diag.trigger("GM change");
                         st.log(format!(
                             "ALARM: grandmaster changed {} → {}",
                             ptp::fmt_clock_identity(&selected_gm.unwrap()),
@@ -429,9 +562,13 @@ pub fn run(
                     ));
                     selected_gm = Some(data.gm_identity);
                 }
-                None => st.log("ALARM: master lost — no Announce within its receipt timeout"),
+                None => {
+                    diag.trigger("master lost");
+                    st.log("ALARM: master lost — no Announce within its receipt timeout")
+                }
             }
             selected = best.map(|b| b.0);
+            diag.on_master_change();
             pending = None;
             last_seq = None;
             // A half-learned model would mix two masters' samples; a
@@ -446,6 +583,7 @@ pub fn run(
                 sync_lost = true;
                 let mut st = state.lock().unwrap();
                 st.sync.as_mut().unwrap().sync_timeouts += 1;
+                diag.trigger("Sync timeout");
                 st.log(format!(
                     "ALARM: Sync stopped — none for {} ms",
                     now.duration_since(t).as_millis()
@@ -478,6 +616,18 @@ pub fn run(
                         let rx_at = Instant::now();
                         match candidates.iter_mut().find(|c| c.port == source) {
                             Some(c) => {
+                                if Some(source) == selected
+                                    && c.data.gm_identity == data.gm_identity
+                                {
+                                    let diff = syncdiag::announce_diff(&c.data, &data);
+                                    if !diff.is_empty() {
+                                        diag.trigger("GM announce change");
+                                        state.lock().unwrap().log(format!(
+                                            "WARNING: GM announce changed: {}",
+                                            diff.join(", ")
+                                        ));
+                                    }
+                                }
                                 c.data = data;
                                 c.last_seen = rx_at;
                                 c.announces += 1;
@@ -513,6 +663,7 @@ pub fn run(
                         sync_interval = log_to_duration(log_interval.clamp(-7, 4));
                         let mut st = state.lock().unwrap();
                         let sm = st.sync.as_mut().unwrap();
+                        sm.nominal_interval_ns = sync_interval.as_nanos() as f64;
                         sm.sync_rx += 1;
                         if let Some(last) = last_seq {
                             let gap = seq.wrapping_sub(last).wrapping_sub(1);
@@ -542,6 +693,7 @@ pub fn run(
 
                         let p = PendingSync {
                             seq,
+                            rx_at,
                             local_ns: stamp_to_local_ns(stamp),
                             sys: t_rx,
                             correction_ns,
@@ -553,11 +705,12 @@ pub fn run(
                                 p,
                                 origin,
                                 0,
+                                None,
+                                None,
                                 &pdelay,
                                 &mut analyzer,
+                                &mut diag,
                                 &state,
-                                &mut last_spike_log,
-                                &mut spikes_unlogged,
                             );
                         }
                     }
@@ -578,6 +731,7 @@ pub fn run(
                                 let tbi = info.gm_time_base_indicator;
                                 if last_tbi.is_some_and(|l| l != tbi) {
                                     st.sync.as_mut().unwrap().time_base_changes += 1;
+                                    diag.trigger("GM time base change");
                                     st.log(format!(
                                         "ALARM: GM time base changed (gmTimeBaseIndicator {} → {tbi}, \
                                          lastGmPhaseChange {})",
@@ -590,15 +744,21 @@ pub fn run(
                         }
                         if pending.as_ref().is_some_and(|p| p.seq == seq) {
                             let p = pending.take().unwrap();
+                            let fup_delay_us = p.rx_at.elapsed().as_secs_f64() * 1e6;
+                            // cumulativeScaledRateOffset = (rateRatio - 1) * 2^41
+                            let rate_ppb = info.map(|i| {
+                                i.cumulative_scaled_rate_offset as f64 / 2f64.powi(41) * 1e9
+                            });
                             sample(
                                 p,
                                 precise_origin,
                                 correction_ns,
+                                Some(fup_delay_us),
+                                rate_ppb,
                                 &pdelay,
                                 &mut analyzer,
+                                &mut diag,
                                 &state,
-                                &mut last_spike_log,
-                                &mut spikes_unlogged,
                             );
                         }
                     }
@@ -609,7 +769,11 @@ pub fn run(
 
         // Housekeeping for the UI.
         let now = Instant::now();
+        let capture_log = diag.poll();
         let mut st = state.lock().unwrap();
+        if let Some(l) = capture_log {
+            st.log(l);
+        }
         st.tai_now_secs = clock.now().secs;
         st.link_delay_ns = pdelay.link_delay_ns;
         st.foreign_masters = candidates
@@ -625,6 +789,9 @@ pub fn run(
         sm.master_port = selected;
         sm.gm = selected.and_then(|s| candidates.iter().find(|c| c.port == s).map(|c| c.data));
         sm.drift_ppb = analyzer.drift_ppb();
+        sm.bursts = diag.bursts;
+        sm.in_burst = diag.in_burst();
+        sm.captures = diag.captures;
         sm.rms_ns = analyzer.rms_ns();
         sm.state = if selected.is_none() {
             SyncState::NoMaster
@@ -648,28 +815,55 @@ fn sample(
     p: PendingSync,
     origin: Timestamp,
     fup_correction_ns: i64,
+    fup_delay_us: Option<f64>,
+    rate_offset_ppb: Option<f64>,
     pdelay: &PeerDelay,
     analyzer: &mut Analyzer,
+    diag: &mut Diag,
     state: &Arc<Mutex<Status>>,
-    last_spike_log: &mut Option<Instant>,
-    spikes_unlogged: &mut u64,
 ) {
     let correction = p.correction_ns + fup_correction_ns;
     // Master time at our receive instant.
     let master_ns =
         origin.to_ns() + correction as i128 + pdelay.link_delay_ns.unwrap_or(0.0).round() as i128;
+    // Freeze the model during a jitter burst, but not forever: a burst that
+    // persists is the new normal and has to be learned.
+    let hold = diag.burst_age().is_some_and(|a| a < HOLD_MAX_SECS);
+    let hold_expired = analyzer.holding() && !hold && diag.burst_age().is_some();
+    if hold_expired {
+        analyzer.reset();
+    }
+    analyzer.set_hold(hold);
     let anomalies = analyzer.add(p.local_ns, master_ns - p.local_ns);
 
     let mut st = state.lock().unwrap();
+    if hold_expired {
+        st.log(format!(
+            "WARNING: jitter burst persists > {HOLD_MAX_SECS:.0} s — relearning the drift model \
+             on the disturbed data"
+        ));
+    }
     let gm = st
         .sync
         .as_ref()
         .and_then(|s| s.gm)
         .map(|g| ptp::fmt_clock_identity(&g.gm_identity))
         .unwrap_or_else(|| "?".into());
+    let (rx_bps, link_errors) = (
+        st.link.rx_bps,
+        st.link.problems.iter().map(|c| c.delta).sum::<u64>(),
+    );
     let mut logs = Vec::new();
+    let mut notes = Vec::new();
+    let nominal_ns;
+    let during_burst = if diag.burst_established() {
+        " — during a jitter burst, may be path delay rather than the master's clock"
+    } else {
+        ""
+    };
     {
         let sm = st.sync.as_mut().unwrap();
+        nominal_ns = sm.nominal_interval_ns;
         sm.correction_ns = Some(correction);
         sm.offset_to_system_ns = Some((master_ns - p.sys.to_ns()) as f64);
         sm.residual_ns = analyzer.last_residual;
@@ -689,17 +883,20 @@ fn sample(
                 Anomaly::Step { size_ns } => {
                     sm.steps += 1;
                     sm.last_step_ns = Some(size_ns);
+                    notes.push("step");
+                    diag.trigger("time step");
                     logs.push(format!(
-                        "ALARM: master time STEP {} (GM {gm})",
-                        fmt_ns(size_ns)
+                        "ALARM: master time STEP {} (GM {gm}){}",
+                        fmt_ns(size_ns),
+                        during_burst
                     ));
                 }
                 Anomaly::Spike { residual_ns } => {
                     sm.spikes += 1;
-                    let now = Instant::now();
-                    if last_spike_log.is_none_or(|t| now.duration_since(t) >= SPIKE_LOG_INTERVAL) {
-                        let more = if *spikes_unlogged > 0 {
-                            format!(" (+{} more since last report)", spikes_unlogged)
+                    notes.push("spike");
+                    if let Some(n) = diag.may_log("spike") {
+                        let more = if n > 0 {
+                            format!(" (+{n} more since last report)")
                         } else {
                             String::new()
                         };
@@ -707,28 +904,36 @@ fn sample(
                             "WARNING: time spike {} on a single Sync{more}",
                             fmt_ns(residual_ns)
                         ));
-                        *last_spike_log = Some(now);
-                        *spikes_unlogged = 0;
-                    } else {
-                        *spikes_unlogged += 1;
                     }
                 }
                 Anomaly::FreqChange { from_ppb, to_ppb } => {
                     sm.freq_changes += 1;
+                    notes.push("freq-change");
+                    diag.trigger("frequency change");
                     logs.push(format!(
-                        "ALARM: master frequency changed {from_ppb:+.0} → {to_ppb:+.0} ppb"
+                        "ALARM: master frequency changed {from_ppb:+.0} → {to_ppb:+.0} ppb{}",
+                        during_burst
                     ));
                 }
-                Anomaly::Unstable { rms_ns } => logs.push(format!(
-                    "ALARM: sync unstable — residual jitter {} RMS",
-                    fmt_ns(rms_ns).trim_start_matches('+')
-                )),
-                Anomaly::Stable { rms_ns } => logs.push(format!(
-                    "Sync stable again — residual jitter {} RMS",
-                    fmt_ns(rms_ns).trim_start_matches('+')
-                )),
+                Anomaly::Unstable { rms_ns } => {
+                    notes.push("unstable");
+                    diag.trigger("unstable");
+                    logs.push(format!(
+                        "ALARM: sync unstable — residual jitter {} RMS",
+                        fmt_ns(rms_ns).trim_start_matches('+')
+                    ))
+                }
+                Anomaly::Stable { rms_ns } => {
+                    notes.push("stable");
+                    logs.push(format!(
+                        "Sync stable again — residual jitter {} RMS",
+                        fmt_ns(rms_ns).trim_start_matches('+')
+                    ))
+                }
                 Anomaly::Relearn { outliers } => {
                     sm.relearns += 1;
+                    notes.push("relearn");
+                    diag.trigger("erratic");
                     logs.push(format!(
                         "ALARM: master time erratic — {outliers} consecutive Syncs fit \
                          neither the drift model nor each other; relearning"
@@ -736,6 +941,32 @@ fn sample(
                 }
             }
         }
+    }
+    let was_in_burst = diag.in_burst();
+    logs.extend(
+        diag.on_sample(
+            SampleRec {
+                wall: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                seq: p.seq,
+                local_ns: p.local_ns,
+                origin_ns: origin.to_ns(),
+                error_ns: analyzer.last_error,
+                correction_ns: correction,
+                link_delay_ns: pdelay.link_delay_ns,
+                fup_delay_us,
+                rate_offset_ppb,
+                rx_bps,
+                link_errors,
+                note: notes.join(";"),
+                ..Default::default()
+            },
+            nominal_ns,
+        ),
+    );
+    if was_in_burst && !diag.in_burst() {
+        analyzer.rebaseline();
     }
     for l in logs {
         st.log(l);
@@ -798,7 +1029,7 @@ mod tests {
         let ev = feed(&mut a, 0, 200, 500.0, |i| if i >= 100 { 50_000 } else { 0 });
         assert_eq!(ev.len(), 1, "{ev:?}");
         match ev[0] {
-            (101, Anomaly::Step { size_ns }) => assert!((size_ns - 50_000.0).abs() < 10.0),
+            (102, Anomaly::Step { size_ns }) => assert!((size_ns - 50_000.0).abs() < 10.0),
             other => panic!("unexpected {other:?}"),
         }
         assert!(a.last_residual.unwrap().abs() < 10.0);
@@ -851,7 +1082,16 @@ mod tests {
                 .any(|(_, e)| matches!(e, Anomaly::FreqChange { .. })),
             "{ev:?}"
         );
-        assert!((a.drift_ppb().unwrap() - 2_000.0).abs() < 50.0);
+        // A ramp is not a time step.
+        assert!(
+            !ev.iter().any(|(_, e)| matches!(e, Anomaly::Step { .. })),
+            "{ev:?}"
+        );
+        assert!(
+            (a.drift_ppb().unwrap() - 2_000.0).abs() < 50.0,
+            "drift {:?} {ev:?}",
+            a.drift_ppb()
+        );
     }
 
     #[test]
@@ -892,6 +1132,46 @@ mod tests {
         let ev = feed(&mut a, 120, 100, 300.0, |_| 5_000_000_000);
         assert!(ev.is_empty(), "{ev:?}");
         assert!(a.ready() && a.last_residual.unwrap().abs() < 10.0);
+    }
+
+    #[test]
+    fn rebaseline_defers_frequency_checks() {
+        let mut a = Analyzer::new(TH);
+        feed(&mut a, 0, 100, 0.0, |_| 0);
+        a.rebaseline();
+        // A rate change (+300 ppb, phase-continuous) right after the
+        // rebaseline becomes the new reference instead of being reported
+        // against the stale one.
+        let ev = feed(&mut a, 100, 100, 0.0, |i| (i - 100) * 38);
+        assert!(
+            !ev.iter()
+                .any(|(_, e)| matches!(e, Anomaly::FreqChange { .. })),
+            "{ev:?}"
+        );
+        assert!(
+            (a.ref_drift.unwrap() - 300.0).abs() < 20.0,
+            "{:?}",
+            a.ref_drift
+        );
+    }
+
+    #[test]
+    fn hold_keeps_model_through_jitter_and_still_sees_steps() {
+        let mut a = Analyzer::new(TH);
+        feed(&mut a, 0, 100, 500.0, |_| 0);
+        a.set_hold(true);
+        // ±2 µs uniform-ish jitter, around a 2 µs extra delay: all outside
+        // the 1 µs jump threshold, never three within 250 ns of each other.
+        let ev = feed(&mut a, 100, 40, 500.0, |i| -2_000 - (i * 977 % 2_000));
+        assert!(ev.is_empty(), "{ev:?}");
+        // A real step during the hold is still found.
+        let ev = feed(&mut a, 140, 10, 500.0, |_| 80_000);
+        assert!(matches!(ev[..], [(_, Anomaly::Step { .. })]), "{ev:?}");
+        a.set_hold(false);
+        // Model intact: clean samples (with the step) fit immediately.
+        let ev = feed(&mut a, 150, 50, 500.0, |_| 80_000);
+        assert!(ev.is_empty(), "{ev:?}");
+        assert!(a.last_residual.unwrap().abs() < 10.0);
     }
 
     #[test]

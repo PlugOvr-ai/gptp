@@ -2,14 +2,15 @@
 # Install (or remove) gptp-gm as a systemd service.
 #
 #   sudo ./scripts/install-service.sh eth0 --handover 15
-#   sudo ./scripts/install-service.sh eth0 --monitor --log-metrics /var/log/gptp/monitor.jsonl
+#   sudo ./scripts/install-service.sh eth0 --monitor --capture-dir /var/log/gptp/captures
 #   sudo ./scripts/install-service.sh --uninstall [gm|monitor]
 #
 # The interface is required; everything after it is passed verbatim to
 # gptp-gm (e.g. --handover 15 --priority1 1). --no-tui is added automatically.
 # Grandmaster mode installs the service gptp-gm, --monitor installs
 # gptp-monitor, so both can coexist (on different interfaces). The
-# directory of a --log-metrics file is made writable for the service.
+# directory of a --log-metrics file and a --capture-dir are made writable
+# for the service.
 # --uninstall without an argument removes both services and the binary.
 
 set -euo pipefail
@@ -73,11 +74,14 @@ EXTRA_ARGS=("$@")
 
 MONITOR=0
 METRICS_FILE=
+CAPTURE_DIR=
 for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
     case ${EXTRA_ARGS[i]} in
         --monitor) MONITOR=1 ;;
         --log-metrics) METRICS_FILE=${EXTRA_ARGS[i + 1]:-} ;;
         --log-metrics=*) METRICS_FILE=${EXTRA_ARGS[i]#--log-metrics=} ;;
+        --capture-dir) CAPTURE_DIR=${EXTRA_ARGS[i + 1]:-} ;;
+        --capture-dir=*) CAPTURE_DIR=${EXTRA_ARGS[i]#--capture-dir=} ;;
     esac
 done
 
@@ -101,10 +105,12 @@ if grep -qs "^ExecStart=$BIN_DST $IFACE " "$(unit_path "$OTHER")"; then
         "$([[ $OTHER == gptp-gm ]] && echo gm || echo monitor)" >&2
 fi
 
-if [[ -n $METRICS_FILE && $METRICS_FILE != /* ]]; then
-    echo "error: --log-metrics needs an absolute path for the service" >&2
-    exit 1
-fi
+for path in "$METRICS_FILE" "$CAPTURE_DIR"; do
+    if [[ -n $path && $path != /* ]]; then
+        echo "error: --log-metrics / --capture-dir need absolute paths for the service" >&2
+        exit 1
+    fi
+done
 
 # Always (re)build: cargo is incremental, and an old binary would lack
 # newer options such as --monitor.
@@ -131,11 +137,13 @@ fi
 
 install -m 755 "$BIN_SRC" "$BIN_DST"
 
+RW_DIRS=()
+[[ -n $METRICS_FILE ]] && RW_DIRS+=("$(dirname "$METRICS_FILE")")
+[[ -n $CAPTURE_DIR ]] && RW_DIRS+=("$CAPTURE_DIR")
 RW_PATHS=
-if [[ -n $METRICS_FILE ]]; then
-    METRICS_DIR=$(dirname "$METRICS_FILE")
-    mkdir -p "$METRICS_DIR"
-    RW_PATHS="ReadWritePaths=${METRICS_DIR}"
+if [[ ${#RW_DIRS[@]} -gt 0 ]]; then
+    mkdir -p "${RW_DIRS[@]}"
+    RW_PATHS="ReadWritePaths=${RW_DIRS[*]}"
 fi
 
 cat > "$UNIT" <<EOF
@@ -174,4 +182,5 @@ echo
 echo "installed: $UNIT"
 echo "logs:      journalctl -fu $SERVICE"
 [[ -n $METRICS_FILE ]] && echo "metrics:   $METRICS_FILE"
+[[ -n $CAPTURE_DIR ]] && echo "captures:  $CAPTURE_DIR"
 echo "remove:    sudo $0 --uninstall $([[ $MONITOR -eq 1 ]] && echo monitor || echo gm)"

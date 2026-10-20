@@ -37,6 +37,12 @@ pub struct Config {
     #[arg(long, value_name = "PPB", requires = "monitor")]
     pub freq_threshold: Option<f64>,
 
+    /// Monitor: on every alarm (step, jitter burst, GM change, Sync loss,
+    /// ...) write a per-Sync CSV from ~30 s before to ~10 s after it into
+    /// this directory, for offline analysis
+    #[arg(long, value_name = "DIR", requires = "monitor")]
+    pub capture_dir: Option<String>,
+
     /// grandmasterPriority1 — lower wins the BMCA; 1 outranks any default
     /// device (switches/endpoints typically use 246-255)
     #[arg(long, default_value_t = 1)]

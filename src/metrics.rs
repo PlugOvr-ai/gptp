@@ -83,7 +83,7 @@ fn snapshot_json(st: &Status) -> String {
     if let Some(sm) = &st.sync {
         let num = |v: Option<f64>| v.map_or("null".into(), |x| format!("{x:.0}"));
         s.push_str(&format!(
-            "\"sync\":{{\"state\":\"{}\",\"gm\":{},\"offset_to_system_ns\":{},\"residual_ns\":{},\"rms_ns\":{},\"peak_ns\":{:.0},\"drift_ppb\":{},\"correction_ns\":{},\"steps\":{},\"last_step_ns\":{},\"spikes\":{},\"freq_changes\":{},\"relearns\":{},\"gm_changes\":{},\"time_base_changes\":{},\"sync_timeouts\":{},\"sync_rx\":{},\"missing_syncs\":{},\"missing_follow_ups\":{}}},",
+            "\"sync\":{{\"state\":\"{}\",\"gm\":{},\"offset_to_system_ns\":{},\"residual_ns\":{},\"rms_ns\":{},\"peak_ns\":{:.0},\"drift_ppb\":{},\"correction_ns\":{},\"steps\":{},\"last_step_ns\":{},\"spikes\":{},\"freq_changes\":{},\"relearns\":{},\"bursts\":{},\"in_burst\":{},\"captures\":{},\"gm_changes\":{},\"time_base_changes\":{},\"sync_timeouts\":{},\"sync_rx\":{},\"missing_syncs\":{},\"missing_follow_ups\":{}}},",
             sm.state.label(),
             sm.gm.map_or("null".into(), |g| format!(
                 "\"{}\"",
@@ -100,6 +100,9 @@ fn snapshot_json(st: &Status) -> String {
             sm.spikes,
             sm.freq_changes,
             sm.relearns,
+            sm.bursts,
+            sm.in_burst,
+            sm.captures,
             sm.gm_changes,
             sm.time_base_changes,
             sm.sync_timeouts,

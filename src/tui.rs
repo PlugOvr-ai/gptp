@@ -460,6 +460,20 @@ fn draw_monitor_counters(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonito
         ])
         .style(warn(sm.sync_timeouts)),
         Row::new(vec![
+            "Jitter bursts".to_string(),
+            format!(
+                "{}{}{}",
+                sm.bursts,
+                if sm.in_burst { "  NOW" } else { "" },
+                if sm.captures > 0 {
+                    format!("  ({} captures)", sm.captures)
+                } else {
+                    String::new()
+                }
+            ),
+        ])
+        .style(warn(sm.in_burst as u64)),
+        Row::new(vec![
             "Announce received".to_string(),
             c.announce_rx.to_string(),
         ]),

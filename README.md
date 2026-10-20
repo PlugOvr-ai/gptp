@@ -84,10 +84,10 @@ automotive Ethernet switch after a configurable number of minutes.
   is adjusted. Each Sync/Follow_Up gives one sample of *master time − local
   time* against a free-running local timebase (raw PHC with hardware
   timestamps, `CLOCK_MONOTONIC_RAW` otherwise — so NTP/chrony slewing the
-  system clock never looks like a master problem). A linear fit over the
-  last 8 s models the frequency difference; what it does not predict is
-  reported:
-  - **STEP** — two consecutive samples off the model by the same amount:
+  system clock never looks like a master problem). A robust (Theil–Sen)
+  line fit over the last 8 s models the frequency difference — disturbed
+  samples cannot bend it; what it does not predict is reported:
+  - **STEP** — three consecutive samples off the model by the same amount:
     the master's time jumped (GM change, GM stepped its clock, servo
     reset). Size is reported exactly, even for jumps of years; the model is
     re-based and keeps running.
@@ -98,7 +98,44 @@ automotive Ethernet switch after a configurable number of minutes.
   - **erratic** — 8 consecutive samples fit neither the model nor each
     other; the model is discarded and relearned.
   - plus Sync timeouts (3 intervals), sequence gaps, missing Follow_Ups,
-    GM changes (Announce) and `gmTimeBaseIndicator` changes (Follow_Up TLV).
+    GM changes (Announce, including a new GM relayed by the same bridge
+    port) and `gmTimeBaseIndicator` changes (Follow_Up TLV).
+
+  A steady phase ramp (e.g. an abrupt GM frequency change) is told apart
+  from a step and followed by shortening the fit window. During a jitter
+  burst the model is frozen (measured against, not learned from — for at
+  most 30 s), steps then need three samples agreeing within ¼ of the jump
+  threshold, and step/frequency alarms are labelled as possibly path
+  delay; the drift reference is re-taken after a burst. The peer link
+  delay is the median of the last 15 measurements, so queueing during a
+  disturbance does not leak into the time offset afterwards.
+
+  **Diagnostics — why did the jitter go up?** Every Sync also carries
+  context, which is tracked against its own long-term baseline:
+  bridge residence time (`correctionField`), Sync arrival-interval and GM
+  send-interval regularity, peer link delay, Follow_Up latency, the GM's
+  rate ratio (Follow_Up TLV), link load and link error counters, plus the
+  followed GM's Announce fields. Unusual values are logged on their own
+  (rate-limited), e.g. `bridge residence time … typically …`,
+  `irregular Sync arrival`, `peer link delay changed`, `GM announce
+  changed: clockClass 6 → 7 (holdover, within spec)`. A **jitter burst**
+  — 1-s RMS of the residual > 3× its baseline — is logged one second in
+  with what coincided, e.g.
+
+  ```
+  WARNING: jitter burst — 1-s RMS up to 1.568 ms vs baseline 3.43 µs; coincides with:
+    Sync arrival jitter up to 639.99 µs (typically ±7.26 µs) — delay in the path;
+    14 Syncs missing; Follow_Up delay up to 1.2 ms (typically 0.0)
+  ```
+
+  or `no correlated network factor — suspect the GM's time base/servo or
+  local timestamping` when nothing in the network explains it.
+  With `--capture-dir <dir>`, every alarm (burst, step, frequency change,
+  GM/announce/time-base change, Sync loss, …) writes
+  `sync-<UTC>.csv` with one row per Sync from ~30 s before to ~10 s after
+  it (deviation from the model, correction, link delay, arrival/send
+  interval deviation, sequence gaps, Follow_Up delay, rate ratio, link
+  load/errors, event notes) — alarms close together share one file.
 
   The TUI shows a sync-monitor panel (state, GM, drift, residual,
   RMS/peak, counters, master time vs. system clock, bridge residence
@@ -155,6 +192,7 @@ Selected options (see `--help` for all):
 | `--monitor` | off | slave monitor mode: follow the master, report jumps/instability |
 | `--jump-threshold <ns>` | 1000 / 250000 | monitor: spike/step threshold (HW / SW timestamps) |
 | `--freq-threshold <ppb>` | 100 / 5000 | monitor: frequency-change threshold (HW / SW) |
+| `--capture-dir <dir>` | off | monitor: per-Sync CSV around every alarm |
 | `--priority1 <n>` | 1 | grandmasterPriority1, lower wins the BMCA |
 | `--priority2 <n>` | 1 | grandmasterPriority2 |
 | `--clock-class <n>` | 248 | advertised clockClass |
@@ -185,10 +223,12 @@ sudo ./scripts/install-service.sh --uninstall # remove service(s) + binary
 With `--monitor` the script installs a separate `gptp-monitor` service, so
 a grandmaster and a monitor can coexist on different interfaces (it warns
 if both target the same one). The directory of a `--log-metrics` file
-(absolute path) is created and made writable despite `ProtectSystem=strict`:
+(absolute path) and a `--capture-dir` are created and made writable despite
+`ProtectSystem=strict`:
 
 ```sh
-sudo ./scripts/install-service.sh eth0 --monitor --log-metrics /var/log/gptp/monitor.jsonl
+sudo ./scripts/install-service.sh eth0 --monitor \
+    --log-metrics /var/log/gptp/monitor.jsonl --capture-dir /var/log/gptp/captures
 journalctl -fu gptp-monitor
 sudo ./scripts/install-service.sh --uninstall monitor   # or: gm
 ```

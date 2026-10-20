@@ -67,6 +67,13 @@ pub struct SyncMonitor {
     pub freq_changes: u64,
     /// Drift model discarded because the master's time was erratic.
     pub relearns: u64,
+    /// Jitter bursts (1-s RMS far above baseline) seen by the diagnostics.
+    pub bursts: u64,
+    pub in_burst: bool,
+    /// CSV captures written to --capture-dir.
+    pub captures: u64,
+    /// Sync interval announced by the master (logMessageInterval), ns.
+    pub nominal_interval_ns: f64,
     /// Residual of the last sample against the drift model, ns.
     pub residual_ns: Option<f64>,
     /// RMS of the residuals in the fit window, ns.
@@ -103,6 +110,10 @@ impl Default for SyncMonitor {
             spikes: 0,
             freq_changes: 0,
             relearns: 0,
+            bursts: 0,
+            in_burst: false,
+            captures: 0,
+            nominal_interval_ns: 125_000_000.0,
             residual_ns: None,
             rms_ns: None,
             peak_ns: 0.0,
@@ -261,7 +272,7 @@ pub struct Status {
     pub handover_deadline: Option<Instant>,
     pub handover_minutes: Option<f64>,
     pub counters: Counters,
-    /// Smoothed peer-to-peer link delay measured by our own Pdelay_Req, ns.
+    /// Peer-to-peer link delay (median of recent Pdelay_Req measurements), ns.
     pub link_delay_ns: Option<f64>,
     pub foreign_masters: Vec<ForeignMaster>,
     pub nodes: Vec<NodeInfo>,
