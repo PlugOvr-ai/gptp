@@ -78,6 +78,9 @@ pub struct RawSock {
     ts_desc: String,
 }
 
+/// (PTP payload length, receive timestamp, sender MAC)
+pub type Received = (usize, Option<RawStamp>, [u8; 6]);
+
 impl RawSock {
     pub fn open(ifname: &str, force_software: bool) -> Result<Self> {
         let c_ifname = CString::new(ifname)?;
@@ -255,16 +258,18 @@ impl RawSock {
     }
 
     /// Receive one frame; returns the PTP payload length (Ethernet header
-    /// stripped) and its receive timestamp, or None if nothing is pending
-    /// or the frame is our own.
-    pub fn recv(&self, buf: &mut [u8]) -> Result<Option<(usize, Option<RawStamp>)>> {
+    /// stripped), its receive timestamp and the sender's MAC, or None if
+    /// nothing is pending or the frame is our own.
+    pub fn recv(&self, buf: &mut [u8]) -> Result<Option<Received>> {
         match self.recvmsg_ts(buf, 0) {
             Ok(Some((n, pkttype, stamp))) => {
                 if pkttype == libc::PACKET_OUTGOING || n < 14 {
                     return Ok(None);
                 }
+                let mut src = [0u8; 6];
+                src.copy_from_slice(&buf[6..12]);
                 buf.copy_within(14..n, 0);
-                Ok(Some((n - 14, stamp)))
+                Ok(Some((n - 14, stamp, src)))
             }
             Ok(None) => Ok(None),
             Err(e) => Err(e).context("receiving PTP frame"),

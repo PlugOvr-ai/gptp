@@ -210,7 +210,7 @@ pub fn run(
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(100));
         if sock.poll(timeout.as_millis() as i32)? {
-            while let Some((n, stamp)) = sock.recv(&mut rxbuf)? {
+            while let Some((n, stamp, _)) = sock.recv(&mut rxbuf)? {
                 let t_rx = stamp_to_tai(stamp, &sock, &clock).unwrap_or_else(|| clock.now());
                 if let Some(msg) = ptp::parse(&rxbuf[..n]) {
                     if !pdelay.handle(&msg, t_rx, &builder, &sock, &clock, &state) {

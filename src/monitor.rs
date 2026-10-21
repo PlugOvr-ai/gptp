@@ -35,6 +35,7 @@ use crate::clock::{stamp_to_local_ns, stamp_to_tai, TaiClock};
 use crate::clocksync::{self, Rx, SyncEngine};
 use crate::config::{Config, TimeSync};
 use crate::gm::{log_to_duration, Cmd};
+use crate::inventory::fmt_mac;
 use crate::net::{RawSock, RawStamp};
 use crate::pdelay::PeerDelay;
 use crate::ptp::{self, AnnounceData, Msg, MsgBuilder, Timestamp};
@@ -474,6 +475,76 @@ struct PendingSync {
     local_ns: i128,
     sys: Timestamp,
     correction_ns: i64,
+    src_mac: [u8; 6],
+}
+
+/// Recent samples split into their two parts — the GM's origin timestamp
+/// and the bridges' correctionField — so a step can be pinned on one.
+#[derive(Default)]
+struct StepBlame {
+    hist: VecDeque<Part>,
+}
+
+/// (local ns, origin − local ns, correction ns, sender MAC)
+type Part = (i128, i128, i128, [u8; 6]);
+
+impl StepBlame {
+    const KEEP: usize = 16;
+
+    fn push(&mut self, local_ns: i128, origin_ns: i128, correction_ns: i64, mac: [u8; 6]) {
+        self.hist
+            .push_back((local_ns, origin_ns - local_ns, correction_ns as i128, mac));
+        if self.hist.len() > Self::KEEP {
+            self.hist.pop_front();
+        }
+    }
+
+    /// Explain a step of `size_ns` just confirmed on the newest sample. The
+    /// last STEP_SAMPLES samples are the step; each part is extrapolated
+    /// from the samples before it (a bridge relaying a stale origin makes
+    /// both parts ramp, which cancels). Afterwards only the post-step
+    /// samples are kept as the next baseline.
+    fn explain(&mut self, size_ns: f64) -> String {
+        let n = self.hist.len();
+        let Some(&(x, o, c, mac)) = self.hist.back() else {
+            return String::new();
+        };
+        let mut s = format!(" — sender {}", fmt_mac(&mac));
+        if n > STEP_SAMPLES {
+            let pre: Vec<_> = self.hist.iter().take(n - STEP_SAMPLES).collect();
+            let (first, last) = (pre[0], pre[pre.len() - 1]);
+            let extrapolate = |f: fn(&Part) -> i128| -> f64 {
+                let span = (last.0 - first.0) as f64;
+                let slope = if span > 0.0 {
+                    (f(last) - f(first)) as f64 / span
+                } else {
+                    0.0
+                };
+                f(last) as f64 + slope * (x - last.0) as f64
+            };
+            let d_origin = o as f64 - extrapolate(|h| h.1);
+            let d_corr = c as f64 - extrapolate(|h| h.2);
+            let tol = (size_ns.abs() / 10.0).max(1_000.0);
+            if (d_corr - size_ns).abs() < tol && d_origin.abs() < tol {
+                s += "; step is in correctionField (a bridge), origin timestamp unchanged";
+            } else if (d_origin - size_ns).abs() < tol && d_corr.abs() < tol {
+                s += "; step is in the origin timestamp (GM or a bridge relaying it), \
+                      correctionField unchanged";
+            } else {
+                s += &format!(
+                    "; origin timestamp moved {}, correctionField {}",
+                    fmt_ns(d_origin),
+                    fmt_ns(d_corr)
+                );
+            }
+            if last.3 != mac {
+                s += &format!(" (sender changed from {})", fmt_mac(&last.3));
+            }
+        }
+        let drop = n.saturating_sub(STEP_SAMPLES);
+        self.hist.drain(..drop);
+        s
+    }
 }
 
 pub fn run(
@@ -586,6 +657,7 @@ pub fn run(
     let mut selected: Option<[u8; 10]> = None;
     let mut selected_gm: Option<[u8; 8]> = None;
     let mut pending: Option<PendingSync> = None;
+    let mut blame = StepBlame::default();
     let mut last_seq: Option<u16> = None;
     let mut last_sync_at: Option<Instant> = None;
     let mut sync_interval = Duration::from_millis(125);
@@ -765,7 +837,7 @@ pub fn run(
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(50));
         if sock.poll(timeout.as_millis() as i32)? {
-            while let Some((n, stamp)) = sock.recv(&mut rxbuf)? {
+            while let Some((n, stamp, src_mac)) = sock.recv(&mut rxbuf)? {
                 let t_rx = stamp_to_tai(stamp, &sock, &clock).unwrap_or_else(|| clock.now());
                 let Some(msg) = ptp::parse(&rxbuf[..n]) else {
                     continue;
@@ -878,6 +950,7 @@ pub fn run(
                             },
                             sys: t_rx,
                             correction_ns,
+                            src_mac,
                         };
                         if two_step {
                             pending = Some(p);
@@ -897,6 +970,8 @@ pub fn run(
                                     check_system: cfg.time_sync == Some(TimeSync::Linuxptp),
                                     clock: &clock,
                                     state: &state,
+                                    blame: &mut blame,
+                                    fup_mac: src_mac,
                                 },
                             );
                         }
@@ -951,6 +1026,8 @@ pub fn run(
                                     check_system: cfg.time_sync == Some(TimeSync::Linuxptp),
                                     clock: &clock,
                                     state: &state,
+                                    blame: &mut blame,
+                                    fup_mac: src_mac,
                                 },
                             );
                         }
@@ -1017,6 +1094,9 @@ struct Ctx<'a> {
     check_system: bool,
     clock: &'a TaiClock,
     state: &'a Arc<Mutex<Status>>,
+    blame: &'a mut StepBlame,
+    /// Sender of the Follow_Up (of the Sync for one-step).
+    fup_mac: [u8; 6],
 }
 
 /// Process one complete Sync (+ Follow_Up) measurement.
@@ -1037,6 +1117,8 @@ fn sample(
         check_system,
         clock,
         state,
+        blame,
+        fup_mac,
     } = ctx;
     let correction = p.correction_ns + fup_correction_ns;
     // Master time at our receive instant.
@@ -1053,6 +1135,7 @@ fn sample(
     }
     analyzer.set_hold(diag.burst_level().filter(|_| hold));
     let anomalies = analyzer.add(p.local_ns, master_ns - p.local_ns);
+    blame.push(p.local_ns, origin.to_ns(), correction, fup_mac);
 
     let mut st = state.lock().unwrap();
     if hold_expired {
@@ -1103,8 +1186,12 @@ fn sample(
                     sm.last_step_ns = Some(size_ns);
                     notes.push("step");
                     diag.trigger("time step");
+                    let mut why = blame.explain(size_ns);
+                    if p.src_mac != fup_mac {
+                        why += &format!(" (Sync from {})", fmt_mac(&p.src_mac));
+                    }
                     logs.push(format!(
-                        "ALARM: master time STEP {} (GM {gm}){}",
+                        "ALARM: master time STEP {} (GM {gm}){why}{}",
                         fmt_ns(size_ns),
                         during_burst
                     ));
@@ -1447,6 +1534,46 @@ mod tests {
         let ev = feed(&mut a, 156, 50, 500.0, |_| 80_000);
         assert!(ev.is_empty(), "{ev:?}");
         assert!(a.last_residual.unwrap().abs() < 10.0);
+    }
+
+    fn blame_after(origin_step: i128, corr_step: i128, stale_origin: bool) -> String {
+        let mut b = StepBlame::default();
+        let (bridge, other) = ([1, 2, 3, 4, 5, 6], [9, 9, 9, 9, 9, 9]);
+        for i in 0..10i128 {
+            let local = i * 125_000_000;
+            // A stale origin: frozen, the bridge's correction covers the gap.
+            let (mut origin, mut corr) = if stale_origin {
+                (
+                    1_000_000_000_000,
+                    local + 40_000_000_000_000 - 1_000_000_000_000,
+                )
+            } else {
+                (local + 40_000_000_000_000, 500)
+            };
+            if i >= 7 {
+                origin += origin_step;
+                corr += corr_step;
+            }
+            b.push(
+                local,
+                origin,
+                corr as i64,
+                if i >= 7 { other } else { bridge },
+            );
+        }
+        b.explain((origin_step + corr_step) as f64)
+    }
+
+    #[test]
+    fn step_is_blamed_on_the_part_that_moved() {
+        let s = blame_after(0, 22_003_056_000, true);
+        assert!(s.contains("correctionField (a bridge)"), "{s}");
+        assert!(s.contains("sender 09:09:09:09:09:09"), "{s}");
+        assert!(s.contains("sender changed from 01:02:03:04:05:06"), "{s}");
+        let s = blame_after(-1_130_206_958_000, 0, false);
+        assert!(s.contains("in the origin timestamp"), "{s}");
+        let s = blame_after(1_000_000, 2_000_000, false);
+        assert!(s.contains("origin timestamp moved"), "{s}");
     }
 
     #[test]

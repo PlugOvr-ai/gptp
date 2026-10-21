@@ -86,7 +86,11 @@ master's time for jumps and instability instead.
   - **STEP** — three consecutive samples off the model by the same amount:
     the master's time jumped (GM change, GM stepped its clock, servo
     reset). Size is reported exactly, even for jumps of years; the model is
-    re-based and keeps running.
+    re-based and keeps running. The alarm names the sender's MAC and which
+    part of the Sync moved: the GM's origin timestamp or the bridges'
+    correctionField (each extrapolated from the samples before the step,
+    so a bridge relaying a stale origin is handled), and whether the
+    sender changed.
   - **spike** — a single sample off the model (delayed timestamp, usually
     bridge queueing). Logged at most every 10 s, all counted.
   - **frequency change** — the fitted drift leaves its long-term average.
