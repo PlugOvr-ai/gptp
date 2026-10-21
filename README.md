@@ -120,7 +120,8 @@ master's time for jumps and instability instead.
   send-interval regularity, peer link delay, Follow_Up latency, the GM's
   rate ratio (Follow_Up TLV), link load and link error counters, plus the
   followed GM's Announce fields. Unusual values are logged on their own
-  (rate-limited), e.g. `bridge residence time … typically …`,
+  (rate-limited), e.g. `bridge residence time … typically …` (only when
+  the residual shows the bridge did not compensate it),
   `irregular Sync arrival`, `peer link delay changed`, `GM announce
   changed: clockClass 6 → 7 (holdover, within spec)`. A **jitter burst**
   — the residual's 1-s jitter level > 3× its baseline; robust to single

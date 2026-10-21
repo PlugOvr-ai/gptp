@@ -332,7 +332,12 @@ impl Diag {
             }
         }
         let c = rec.correction_ns as f64;
-        if self.corr.unusual(c, 6.0, self.jump_ns / 5.0) {
+        // A bridge that held a Sync longer but put exactly that into
+        // correctionField did its job: only an unusual residence time that
+        // the measurement did not absorb (error beyond the jitter level, or
+        // not known yet) is worth a warning.
+        let compensated = rec.error_ns.is_some_and(|e| e.abs() <= self.jump_ns / 4.0);
+        if self.corr.unusual(c, 6.0, self.jump_ns / 5.0) && !compensated {
             let typical = format!(
                 "{} ± {}",
                 fmt_ns(self.corr.mean),
@@ -843,6 +848,26 @@ mod tests {
         });
         assert!(logs.is_empty(), "{logs:?}");
         assert_eq!(d.bursts, 0);
+    }
+
+    #[test]
+    fn compensated_residence_change_is_not_a_warning() {
+        let mut d = Diag::new(TH, None);
+        feed(&mut d, 0, 200, |i| {
+            (noise(i, 20.0), 5_000_000 + (i % 5) as i64, 0)
+        });
+        // Residence jumps by 300 µs, the residual stays clean: compensated.
+        let logs = feed(&mut d, 200, 3, |i| (noise(i, 20.0), 5_300_000, 0));
+        assert!(
+            !logs.iter().any(|l| l.contains("bridge residence")),
+            "{logs:?}"
+        );
+        // Same jump with the residual off by 2 µs: not compensated.
+        let logs = feed(&mut d, 203, 1, |_| (2_000.0, 5_600_000, 0));
+        assert!(
+            logs.iter().any(|l| l.contains("bridge residence")),
+            "{logs:?}"
+        );
     }
 
     #[test]
