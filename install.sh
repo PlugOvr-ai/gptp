@@ -396,10 +396,12 @@ log() {
     echo "$TAG: $*"
 }
 up() { ping -c1 -W2 "$1" >/dev/null 2>&1; }
-start=$(date +%s)
+uptime_s() { cut -d. -f1 /proc/uptime; }     # monotonic: unaffected by the NTP step
+start=$(uptime_s)
+elapsed() { echo $(( $(uptime_s) - start )); }
 expired() {
     [ "$MAX_WAIT" -gt 0 ] || return 1
-    [ $(( $(date +%s) - start )) -ge "$MAX_WAIT" ]
+    [ "$(elapsed)" -ge "$MAX_WAIT" ]
 }
 all_up() {
     for h in "$@"; do up "$h" || return 1; done
@@ -438,7 +440,7 @@ if command -v hwclock >/dev/null 2>&1 && hwclock -w 2>/dev/null; then
 else
     rtc="RTC not written (no hwclock or no RTC)"
 fi
-log "clock set by NTP at $(date -u +%FT%TZ), timesyncd stopped, $rtc — starting the grandmaster"
+log "clock set by NTP at $(date -u +%FT%TZ) after $(elapsed)s, timesyncd stopped, $rtc — starting the grandmaster"
 exit 0
 EOF
     $SUDO install -m 0755 "$TMP/gm-time-prep.sh" "$PREP"
