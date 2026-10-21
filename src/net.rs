@@ -28,6 +28,8 @@ const SOF_TIMESTAMPING_SOFTWARE: u32 = 1 << 4;
 const SOF_TIMESTAMPING_RAW_HARDWARE: u32 = 1 << 6;
 
 const SIOCETHTOOL: libc::c_ulong = 0x8946;
+/// Minimum Ethernet frame without FCS.
+const MIN_FRAME: usize = 60;
 const SIOCSHWTSTAMP: libc::c_ulong = 0x89b0;
 const SIOCGHWTSTAMP: libc::c_ulong = 0x89b1;
 const ETHTOOL_GET_TS_INFO: u32 = 0x41;
@@ -192,6 +194,11 @@ impl RawSock {
         frame.extend_from_slice(&self.mac);
         frame.extend_from_slice(&ETH_P_1588.to_be_bytes());
         frame.extend_from_slice(payload);
+        // Pad to the Ethernet minimum ourselves (a Sync is 58 bytes): some
+        // drivers pad short frames by copying them, and the copy loses its
+        // transmit timestamp request — every Sync then misses its stamp.
+        // Receivers go by messageLength, so trailing zeros are harmless.
+        frame.resize(frame.len().max(MIN_FRAME), 0);
         frame
     }
 
