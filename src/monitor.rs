@@ -48,6 +48,15 @@ const WINDOW: usize = 64;
 const MIN_SAMPLES: usize = 8;
 /// Consistent out-of-model samples that make a step.
 const STEP_SAMPLES: usize = 3;
+/// Learning restarts (inconsistent samples) before the model is learned
+/// from noisy data anyway.
+const LEARN_RESTARTS: usize = 4;
+/// Samples kept while learning, for learning from noisy data.
+const LEARN_BUF: usize = 32;
+/// With a noisy master, spikes/steps must exceed this many σ of its noise,
+/// and a step's samples must agree within NOISE_TIGHT σ.
+const NOISE_JUMP: f64 = 6.0;
+const NOISE_TIGHT: f64 = 4.0;
 /// Re-check the drift for frequency changes every this many samples.
 const FREQ_CHECK_EVERY: usize = 8;
 const HISTORY: usize = 240;
@@ -102,6 +111,12 @@ pub enum Anomaly {
         rms_ns: f64,
     },
     /// Too many consecutive samples off the model; it was discarded.
+    /// The master's time is too noisy for the configured thresholds; the
+    /// model was learned anyway and the thresholds follow the noise.
+    Noisy {
+        sigma_ns: f64,
+        jump_ns: f64,
+    },
     Relearn {
         outliers: usize,
     },
@@ -114,6 +129,8 @@ struct Fit {
     /// Slope, ns per s = ppb.
     b: f64,
     rms: f64,
+    /// Robust σ of the residuals (1.4826 × MAD), ns.
+    sigma: f64,
 }
 
 impl Fit {
@@ -148,6 +165,13 @@ pub struct Analyzer {
     /// Deviation of the last sample from the model, however it was
     /// classified (None while learning).
     pub last_error: Option<f64>,
+    /// Learning restarts since the last reset.
+    learn_restarts: usize,
+    /// Recent samples while learning (not cleared by restarts).
+    learn_buf: VecDeque<(f64, f64)>,
+    /// Robust σ of the master's noise once it has proven too noisy for the
+    /// configured thresholds; 0 = not noisy. Survives resets.
+    noise: f64,
 }
 
 impl Analyzer {
@@ -166,12 +190,34 @@ impl Analyzer {
             outliers: 0,
             last_residual: None,
             last_error: None,
+            learn_restarts: 0,
+            learn_buf: VecDeque::with_capacity(LEARN_BUF + 1),
+            noise: 0.0,
         }
     }
 
-    /// Forget everything and start learning from the next sample.
+    /// Forget everything and start learning from the next sample. A known
+    /// noise level is kept: the master (or the path) is likely the same.
     pub fn reset(&mut self) {
+        let noise = self.noise;
         *self = Analyzer::new(self.th);
+        self.noise = noise;
+    }
+
+    /// Spike/step threshold: the configured one, or wider for a noisy master.
+    fn jump(&self) -> f64 {
+        self.th.jump_ns.max(NOISE_JUMP * self.noise)
+    }
+
+    /// How closely a step's samples must agree.
+    fn tight(&self) -> f64 {
+        self.th.jitter_ns().max(NOISE_TIGHT * self.noise)
+    }
+
+    /// Robust σ of the master's noise, if it is too noisy for the
+    /// configured thresholds.
+    pub fn noise_ns(&self) -> Option<f64> {
+        (self.noise > 0.0).then_some(self.noise)
     }
 
     /// Re-take the drift reference once the whole window has been replaced
@@ -222,13 +268,39 @@ impl Analyzer {
             // Learning: only a run of mutually consistent samples may form
             // the model — restart if this one does not continue the line
             // through the previous two.
+            // A master noisier than the threshold never gives such a run:
+            // after a few restarts, learn from the recent samples anyway
+            // (the fit is robust) and let the thresholds follow the noise.
+            self.learn_buf.push_back((x, y_raw as f64));
+            if self.learn_buf.len() > LEARN_BUF {
+                self.learn_buf.pop_front();
+            }
             let n = self.window.len();
             if n >= 2 {
                 let (x1, y1) = self.window[n - 2];
                 let (x2, y2) = self.window[n - 1];
                 let pred = y2 + (y2 - y1) / (x2 - x1).max(1e-9) * (x - x2);
-                if (y_raw as f64 - pred).abs() > self.th.jump_ns {
+                if (y_raw as f64 - pred).abs() > self.jump() {
                     self.window.clear();
+                    self.learn_restarts += 1;
+                }
+            }
+            if self.learn_restarts >= LEARN_RESTARTS && self.learn_buf.len() >= 2 * MIN_SAMPLES {
+                let fit = fit_line(&self.learn_buf);
+                // Beyond 100× the threshold it is garbage, not noise.
+                if NOISE_JUMP * fit.sigma > self.th.jump_ns / 2.0
+                    && fit.sigma < 100.0 * self.th.jump_ns
+                {
+                    self.window = self.learn_buf.clone();
+                    self.noise = fit.sigma;
+                    self.fit = Some(fit);
+                    out.push(Anomaly::Noisy {
+                        sigma_ns: fit.sigma,
+                        jump_ns: self.jump(),
+                    });
+                    self.last_residual = None;
+                    self.last_error = None;
+                    return out;
                 }
             }
             self.push(x, y_raw as f64);
@@ -241,12 +313,12 @@ impl Analyzer {
         self.last_error = Some(r);
 
         if let Some(level) = self.hold {
-            if r.abs() <= self.th.jump_ns.max(4.0 * level) {
+            if r.abs() <= self.jump().max(4.0 * level) {
                 self.suspects.clear();
-                self.last_residual = (r.abs() <= self.th.jump_ns).then_some(r);
+                self.last_residual = (r.abs() <= self.jump()).then_some(r);
                 return out;
             }
-            let tight = self.th.jitter_ns();
+            let tight = self.tight();
             if !self.suspects.iter().all(|s| (r - s.2).abs() <= tight) {
                 self.suspects.clear();
             }
@@ -258,18 +330,14 @@ impl Analyzer {
             return out;
         }
 
-        if r.abs() <= self.th.jump_ns {
+        if r.abs() <= self.jump() {
             for (_, _, sr) in self.suspects.drain(..) {
                 out.push(Anomaly::Spike { residual_ns: sr });
             }
             self.outliers = 0;
             self.push(x, y_raw as f64);
             self.last_residual = Some(r);
-        } else if self
-            .suspects
-            .iter()
-            .all(|s| (r - s.2).abs() <= self.th.jump_ns)
-        {
+        } else if self.suspects.iter().all(|s| (r - s.2).abs() <= self.jump()) {
             if self.suspects.len() + 1 < STEP_SAMPLES {
                 // Held back: its residual is reported once classified (as a
                 // spike), or dropped if it turns out to be part of a step.
@@ -316,7 +384,7 @@ impl Analyzer {
             // A step needs the samples to agree tightly; samples that only
             // roughly agree are path-delay jitter (e.g. three similarly
             // queued Syncs at the onset of congestion).
-            let tight = self.th.jitter_ns();
+            let tight = self.tight();
             if self.suspects.iter().all(|s| (r - s.2).abs() <= tight) {
                 self.suspects.push((x, y_raw, r));
                 out.push(self.apply_step(bx, by, y_raw, pred, r));
@@ -405,6 +473,15 @@ impl Analyzer {
             self.window.pop_front();
         }
         self.fit = (self.window.len() >= MIN_SAMPLES).then(|| fit_line(&self.window));
+        // Follow a noisy master's noise level; drop it once the noise fits
+        // the configured threshold again.
+        if let (true, Some(f)) = (self.noise > 0.0, self.fit) {
+            self.noise = if NOISE_JUMP * f.sigma > self.th.jump_ns / 2.0 {
+                f.sigma
+            } else {
+                0.0
+            };
+        }
     }
 }
 
@@ -432,7 +509,9 @@ fn fit_line(pts: &VecDeque<(f64, f64)>) -> Fit {
         .sum::<f64>()
         / n as f64)
         .sqrt();
-    Fit { a, b, rms }
+    let mut abs: Vec<f64> = pts.iter().map(|p| (p.1 - (a + b * p.0)).abs()).collect();
+    let sigma = 1.4826 * median(&mut abs).unwrap_or(0.0);
+    Fit { a, b, rms, sigma }
 }
 
 fn median(v: &mut [f64]) -> Option<f64> {
@@ -1064,6 +1143,7 @@ pub fn run(
         sm.in_burst = diag.in_burst();
         sm.captures = diag.captures;
         sm.rms_ns = analyzer.rms_ns();
+        sm.noise_ns = analyzer.noise_ns();
         sm.state = if selected.is_none() {
             SyncState::NoMaster
         } else if sync_lost
@@ -1235,6 +1315,17 @@ fn sample(
                         fmt_ns(rms_ns).trim_start_matches('+')
                     ))
                 }
+                Anomaly::Noisy { sigma_ns, jump_ns } => {
+                    notes.push("noisy");
+                    diag.trigger("noisy master");
+                    logs.push(format!(
+                        "WARNING: master time is noisy (σ {}) — learned anyway; spikes/steps \
+                         now need {} (master time converted from the system clock, or \
+                         software timestamps?)",
+                        fmt_ns(sigma_ns).trim_start_matches('+'),
+                        fmt_ns(jump_ns).trim_start_matches('+')
+                    ));
+                }
                 Anomaly::Relearn { outliers } => {
                     sm.relearns += 1;
                     notes.push("relearn");
@@ -1369,6 +1460,64 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Deterministic Gaussian noise, ns.
+    fn noise(i: i128, sigma: f64) -> i128 {
+        let h = |k: i128| {
+            let mut z = (i * 2 + k) as u64 ^ 0x9E37_79B9_7F4A_7C15;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64 + 1e-12
+        };
+        ((-2.0 * h(0).ln()).sqrt() * (2.0 * std::f64::consts::PI * h(1)).cos() * sigma) as i128
+    }
+
+    #[test]
+    fn noisy_master_is_learned_and_reported_not_stuck() {
+        let mut a = Analyzer::new(TH);
+        let out = feed(&mut a, 0, 400, 3_000.0, |i| noise(i, 3_000.0));
+        assert!(a.ready(), "stuck learning");
+        let noisy: Vec<_> = out
+            .iter()
+            .filter(|(_, an)| matches!(an, Anomaly::Noisy { .. }))
+            .collect();
+        assert_eq!(noisy.len(), 1, "{out:?}");
+        assert!(noisy[0].0 < 80, "learned only at sample {}", noisy[0].0);
+        assert!(out
+            .iter()
+            .any(|(_, an)| matches!(an, Anomaly::Unstable { .. })));
+        assert!(!out
+            .iter()
+            .any(|(_, an)| matches!(an, Anomaly::Step { .. } | Anomaly::Relearn { .. })));
+        let sigma = a.noise_ns().unwrap();
+        assert!((2_000.0..4_500.0).contains(&sigma), "σ {sigma}");
+    }
+
+    #[test]
+    fn noisy_master_step_is_still_detected() {
+        let mut a = Analyzer::new(TH);
+        feed(&mut a, 0, 200, 0.0, |i| noise(i, 3_000.0));
+        let out = feed(&mut a, 200, 100, 0.0, |i| 200_000 + noise(i, 3_000.0));
+        let steps: Vec<f64> = out
+            .iter()
+            .filter_map(|(_, an)| match an {
+                Anomaly::Step { size_ns } => Some(*size_ns),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps.len(), 1, "{out:?}");
+        assert!((steps[0] - 200_000.0).abs() < 15_000.0, "{steps:?}");
+    }
+
+    #[test]
+    fn clean_master_clears_the_noise_level() {
+        let mut a = Analyzer::new(TH);
+        feed(&mut a, 0, 200, 0.0, |i| noise(i, 3_000.0));
+        assert!(a.noise_ns().is_some());
+        feed(&mut a, 200, 200, 0.0, |i| noise(i, 5.0));
+        assert!(a.noise_ns().is_none());
+        assert!(!a.unstable());
     }
 
     #[test]

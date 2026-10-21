@@ -8,6 +8,7 @@ use anyhow::Result;
 
 use crate::clock::{stamp_to_tai, TaiClock};
 use crate::config::Config;
+use crate::gmclock;
 use crate::net::RawSock;
 use crate::pdelay::PeerDelay;
 use crate::ptp::{self, AnnounceData, Msg};
@@ -28,6 +29,7 @@ pub fn run(
     state: Arc<Mutex<Status>>,
     cmds: Receiver<Cmd>,
 ) -> Result<()> {
+    let (clock, mut discipline, time_desc, clock_logs) = gmclock::setup(&cfg, &sock, clock);
     let clock_identity = ptp::clock_identity_from_mac(sock.mac);
     let builder = ptp::MsgBuilder {
         clock_identity,
@@ -61,7 +63,7 @@ pub fn run(
         st.priority2 = cfg.priority2;
         st.clock_class = cfg.clock_class;
         st.domain = cfg.domain;
-        st.time_source_desc = clock.describe().to_string();
+        st.time_source_desc = time_desc;
         st.ts_desc = sock.ts_desc().to_string();
         st.ts_hardware = sock.is_hardware_ts();
         st.utc_offset = clock.utc_offset();
@@ -73,6 +75,9 @@ pub fn run(
             cfg.iface(),
             ptp::fmt_clock_identity(&clock_identity)
         ));
+        for l in clock_logs {
+            st.log(l);
+        }
         if let Some(m) = cfg.handover {
             st.log(format!(
                 "Handover mode: will stop announcing after {m} min and yield to the switch"
@@ -197,9 +202,20 @@ pub fn run(
         }
 
         pdelay.tick(now, &builder, &sock, &clock, &state);
+        // Steered also while passive, so a takeover serves the right time.
+        if let Some((logs, desc)) = discipline.as_mut().and_then(|d| d.tick(now)) {
+            let mut st = state.lock().unwrap();
+            st.time_source_desc = desc;
+            for l in logs {
+                st.log(l);
+            }
+        }
 
         // Sleep until the next timer, waking early for received frames.
         let mut deadline = pdelay.next;
+        if let Some(d) = &discipline {
+            deadline = deadline.min(d.next());
+        }
         if gm_active {
             deadline = deadline.min(next_announce).min(next_sync);
         }

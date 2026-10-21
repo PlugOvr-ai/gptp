@@ -15,6 +15,9 @@ pub struct TaiClock {
     kernel_tai: bool,
     /// Deliberate error added to the served time (--time-error), ns.
     error_ns: i128,
+    /// The grandmaster's time is this NIC hardware clock (which carries
+    /// TAI): hardware stamps are used as they are.
+    phc: Option<libc::clockid_t>,
 }
 
 impl TaiClock {
@@ -31,7 +34,15 @@ impl TaiClock {
             },
             kernel_tai,
             error_ns: 0,
+            phc: None,
         }
+    }
+
+    /// Serve the time of this PHC (already set to TAI) instead of the
+    /// system clock.
+    pub fn with_phc(mut self, clock_id: libc::clockid_t) -> Self {
+        self.phc = Some(clock_id);
+        self
     }
 
     /// Serve time deliberately off by `secs` (fault injection for testing
@@ -42,7 +53,10 @@ impl TaiClock {
     }
 
     pub fn now(&self) -> Timestamp {
-        self.realtime_to_tai(raw(libc::CLOCK_REALTIME))
+        match self.phc {
+            Some(id) => raw(id),
+            None => self.realtime_to_tai(raw(libc::CLOCK_REALTIME)),
+        }
     }
 
     /// Convert a CLOCK_REALTIME-based timestamp (e.g. a kernel software
@@ -74,16 +88,18 @@ impl TaiClock {
 }
 
 /// Convert a raw packet timestamp to the PTP (TAI) timescale. Hardware
-/// stamps are in the PHC timebase and are shifted by a fresh
-/// (PHC, CLOCK_REALTIME) cross-timestamp; software stamps are
-/// CLOCK_REALTIME-based.
+/// stamps are in the PHC timebase: as they are when the PHC is the time
+/// source, else shifted by a fresh (PHC, CLOCK_REALTIME) cross-timestamp.
+/// Software stamps are CLOCK_REALTIME-based.
 pub fn stamp_to_tai(
     stamp: Option<RawStamp>,
     sock: &RawSock,
     clock: &TaiClock,
 ) -> Option<Timestamp> {
     let s = stamp?;
-    if s.hardware {
+    if s.hardware && clock.phc.is_some() {
+        Some(s.ts)
+    } else if s.hardware {
         let (phc_ns, real_ns) = sock.phc()?.sample_offset_pair()?;
         Some(clock.realtime_ns_to_tai(s.ts.to_ns() - phc_ns + real_ns))
     } else {

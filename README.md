@@ -82,7 +82,11 @@ master's time for jumps and instability instead.
   timestamps, `CLOCK_MONOTONIC_RAW` otherwise — so NTP/chrony slewing the
   system clock never looks like a master problem). A robust (Theil–Sen)
   line fit over the last 8 s models the frequency difference — disturbed
-  samples cannot bend it; what it does not predict is reported:
+  samples cannot bend it; what it does not predict is reported. A master
+  noisier than the jump threshold (e.g. a GM converting each stamp from
+  its system clock) is still learned after a few restarts: it is reported
+  as noisy with its σ, the state shows UNSTABLE, and spike/step detection
+  then needs 6σ until the noise is gone.
   - **STEP** — three consecutive samples off the model by the same amount:
     the master's time jumped (GM change, GM stepped its clock, servo
     reset). Size is reported exactly, even for jumps of years; the model is
@@ -301,6 +305,7 @@ Selected options (see `--help` for all):
 | `--domain <n>` | 0 | gPTP domain |
 | `--log-sync-interval <n>` | -3 | log2 Sync interval (-3 = 8/s) |
 | `--utc-offset <s>` | 37 | UTC→TAI offset when the kernel TAI offset is unset |
+| `--gm-clock <src>` | auto | time source: `phc-disciplined` with hardware timestamps, else `system`; or `phc` (free-running NIC clock) |
 | `--force-sw-timestamps` | off | skip NIC hardware timestamping even if available |
 | `--scan-subnet <CIDR>` | off | ARP-sweep this subnet (/22../30) to find silent nodes |
 | `--no-inventory` | off | disable node discovery and latency probing |
@@ -347,11 +352,18 @@ restart the service, so a reinstall picks up new code and arguments.
   distributes the system clock, it does not discipline it.
 - **Hardware timestamping is used automatically** when the NIC supports it
   (e.g. Raspberry Pi 5 / CM4; check with `ethtool -T eth0`): frames are
-  stamped in the MAC/PHY via `SO_TIMESTAMPING`, and each stamp is converted
-  from the PHC timebase to TAI with a kernel cross-timestamp
-  (`PTP_SYS_OFFSET_PRECISE`, falling back to `PTP_SYS_OFFSET`) — no `phc2sys`
-  needed. Sync origin (via the two-step Follow_Up), pdelay t1–t4: all
-  hardware-stamped. Expect sub-microsecond wire accuracy.
+  stamped in the MAC/PHY via `SO_TIMESTAMPING`. Sync origin (via the
+  two-step Follow_Up), pdelay t1–t4: all hardware-stamped.
+- **Grandmaster time source (`--gm-clock`).** By default (`auto`) the NIC's
+  hardware clock (PHC) is the time: at start its frequency is matched to the
+  system clock (2 s) and it is set to TAI, then a slow PI servo keeps it on
+  the system clock (`phc-disciplined`, like `phc2sys`), and hardware stamps
+  are sent as they are. `phc` sets it once and lets it run free (smoothest,
+  but drifts from UTC with the NIC's crystal). `system` converts every
+  stamp with a fresh kernel cross-timestamp (`PTP_SYS_OFFSET_PRECISE`, else
+  `PTP_SYS_OFFSET`): where those are only µs-accurate, that noise and every
+  NTP adjustment reach the network directly — slaves see µs jitter. Do not
+  run `phc2sys` on the same NIC with the phc modes.
 - **When only software timestamping is available** (e.g. Raspberry Pi 4's
   NIC has no PHC), the program says so clearly: a red **⚠ SW TIMESTAMPS
   ONLY** badge in the TUI title bar and Clock panel, `ts=SW-ONLY(!)` in

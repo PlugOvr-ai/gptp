@@ -16,6 +16,23 @@ pub enum TimeSync {
     Linuxptp,
 }
 
+/// Where the grandmaster's time comes from.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GmClock {
+    /// phc-disciplined with hardware timestamps, system otherwise
+    Auto,
+    /// The system clock: each hardware stamp is converted with a fresh
+    /// NIC/system clock reading (its noise and NTP adjustments reach the
+    /// network directly)
+    System,
+    /// The NIC hardware clock alone: set once from the system clock, then
+    /// free-running — smoothest, but drifts from UTC with the NIC's crystal
+    Phc,
+    /// The NIC hardware clock, steered slowly toward the system clock (like
+    /// phc2sys): smooth and on UTC
+    PhcDisciplined,
+}
+
 /// gPTP (IEEE 802.1AS) grandmaster with timed handover, and slave monitor.
 ///
 /// Sends Announce + Sync/Follow_Up as forced grandmaster on one interface and
@@ -44,6 +61,16 @@ pub struct Config {
     /// loss and GM changes. No clock is adjusted unless --time-sync builtin.
     #[arg(long)]
     pub monitor: bool,
+
+    /// Grandmaster time source (needs hardware timestamps for phc modes)
+    #[arg(
+        long,
+        value_enum,
+        value_name = "SOURCE",
+        default_value = "auto",
+        conflicts_with = "monitor"
+    )]
+    pub gm_clock: GmClock,
 
     /// Monitor: a deviation from the drift model beyond this is a spike
     /// (one sample) or a step (persistent). Default 1000 ns with hardware

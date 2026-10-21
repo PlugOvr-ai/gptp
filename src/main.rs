@@ -2,6 +2,7 @@ mod clock;
 mod clocksync;
 mod config;
 mod gm;
+mod gmclock;
 mod inventory;
 mod linkstats;
 mod metrics;

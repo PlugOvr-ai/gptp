@@ -78,6 +78,8 @@ pub struct SyncMonitor {
     pub residual_ns: Option<f64>,
     /// RMS of the residuals in the fit window, ns.
     pub rms_ns: Option<f64>,
+    /// Robust σ of a master too noisy for the configured thresholds.
+    pub noise_ns: Option<f64>,
     /// Largest |residual| since start (steps excluded), ns.
     pub peak_ns: f64,
     pub last_step_ns: Option<f64>,
@@ -125,6 +127,7 @@ impl Default for SyncMonitor {
             nominal_interval_ns: 125_000_000.0,
             residual_ns: None,
             rms_ns: None,
+            noise_ns: None,
             peak_ns: 0.0,
             last_step_ns: None,
             drift_ppb: None,

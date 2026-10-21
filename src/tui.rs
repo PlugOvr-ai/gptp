@@ -389,9 +389,13 @@ fn draw_sync_monitor(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonitor) {
             alarm(
                 sm.state == SyncState::Unstable,
                 format!(
-                    "{} / {}",
+                    "{} / {}{}",
                     ns(sm.rms_ns).trim_start_matches('+'),
-                    fmt_ns(sm.peak_ns).trim_start_matches('+')
+                    fmt_ns(sm.peak_ns).trim_start_matches('+'),
+                    sm.noise_ns.map_or(String::new(), |n| format!(
+                        "  (noisy master, σ {})",
+                        fmt_ns(n).trim_start_matches('+')
+                    ))
                 ),
             ),
         ),
