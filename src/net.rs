@@ -73,6 +73,11 @@ pub enum TsMode {
 
 pub struct RawSock {
     fd: RawFd,
+    /// Send-only socket without timestamping for general messages
+    /// (Announce, Follow_Up, ...), as ptp4l does: on the timestamping socket
+    /// they would request transmit stamps too, and many NICs take only one
+    /// at a time — the next Sync's or Pdelay's stamp could be lost.
+    gen_fd: RawFd,
     pub mac: [u8; 6],
     ts_mode: TsMode,
     ts_desc: String,
@@ -155,9 +160,11 @@ impl RawSock {
             ));
         }
 
+        let gen_fd = open_general(ifindex).map_err(close_on_err)?;
         let (ts_mode, ts_desc) = init_timestamping(fd, ifname, force_software);
         Ok(RawSock {
             fd,
+            gen_fd,
             mac,
             ts_mode,
             ts_desc,
@@ -189,31 +196,17 @@ impl RawSock {
     }
 
     fn raw_send(&self, frame: &[u8]) -> Result<()> {
-        let rc = unsafe {
-            libc::send(
-                self.fd,
-                frame.as_ptr() as *const libc::c_void,
-                frame.len(),
-                0,
-            )
-        };
-        if rc < 0 {
-            return Err(io::Error::last_os_error()).context("sending PTP frame");
-        }
-        Ok(())
+        send_on(self.fd, frame)
     }
 
     /// Send a PTP payload without needing its transmit timestamp.
     pub fn send(&self, payload: &[u8]) -> Result<()> {
-        self.raw_send(&self.frame(payload))?;
-        self.drain_errqueue();
-        Ok(())
+        send_on(self.gen_fd, &self.frame(payload))
     }
 
     /// Send a PTP payload and return its transmit timestamp from the socket
     /// error queue (matched by message type + sequence id). Returns None if
-    /// no timestamp arrives within ~5 ms — the caller falls back to a
-    /// clock sample taken around the send.
+    /// no timestamp arrives within 20 ms.
     pub fn send_stamped(&self, payload: &[u8]) -> Result<Option<RawStamp>> {
         let want_type = payload[0] & 0x0F;
         let want_seq = [payload[30], payload[31]];
@@ -223,7 +216,9 @@ impl RawSock {
             return Ok(None);
         }
 
-        let deadline = Instant::now() + Duration::from_millis(5);
+        // Some drivers deliver transmit stamps late (ptp4l users raise
+        // tx_timestamp_timeout for them); a late stamp is still exact.
+        let deadline = Instant::now() + Duration::from_millis(20);
         let mut buf = [0u8; 512];
         loop {
             match self.recvmsg_ts(&mut buf, libc::MSG_ERRQUEUE) {
@@ -361,8 +356,50 @@ impl RawSock {
 
 impl Drop for RawSock {
     fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
+        unsafe {
+            libc::close(self.fd);
+            libc::close(self.gen_fd);
+        }
     }
+}
+
+fn send_on(fd: RawFd, frame: &[u8]) -> Result<()> {
+    let rc = unsafe { libc::send(fd, frame.as_ptr() as *const libc::c_void, frame.len(), 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error()).context("sending PTP frame");
+    }
+    Ok(())
+}
+
+/// A send-only AF_PACKET socket on the interface (protocol 0: receives
+/// nothing), without timestamping.
+fn open_general(ifindex: u32) -> Result<RawFd> {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).context("opening AF_PACKET send socket");
+    }
+    let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    sll.sll_family = libc::AF_PACKET as u16;
+    sll.sll_ifindex = ifindex as i32;
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sll as *const libc::sockaddr_ll as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e).context("binding send socket to interface");
+    }
+    Ok(fd)
 }
 
 /// Probe and enable the best available timestamping mode.

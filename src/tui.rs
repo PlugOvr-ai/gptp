@@ -662,6 +662,15 @@ fn draw_counters(f: &mut Frame, area: Rect, st: &Status) {
             "Foreign Sync received".to_string(),
             c.foreign_sync_rx.to_string(),
         ]),
+        Row::new(vec![
+            "TX hw stamp missed".to_string(),
+            c.tx_stamp_missed.to_string(),
+        ])
+        .style(if c.tx_stamp_missed > 0 {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        }),
     ];
     let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(10)])
         .block(Block::default().borders(Borders::ALL).title(" Traffic "));

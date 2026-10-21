@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::clock::{stamp_to_tai, TaiClock};
+use crate::clock::{stamp_to_tai, tx_stamp_missed, TaiClock};
 use crate::net::RawSock;
 use crate::ptp::{Msg, MsgBuilder, Timestamp};
 use crate::state::Status;
@@ -64,6 +64,15 @@ impl PeerDelay {
             let msg = builder.pdelay_req(self.seq);
             let fallback = clock.now();
             if let Ok(raw) = sock.send_stamped(&msg) {
+                // Without a hardware t1 this measurement would be µs off.
+                if tx_stamp_missed(sock, &raw) {
+                    let mut st = state.lock().unwrap();
+                    st.counters.tx_stamp_missed += 1;
+                    st.counters.pdelay_req_tx += 1;
+                    self.pending = None;
+                    self.next = crate::gm::catch_up(self.next, INTERVAL, now);
+                    return;
+                }
                 let t1 = stamp_to_tai(raw, sock, clock).unwrap_or(fallback);
                 self.pending = Some(Pending {
                     seq: self.seq,
@@ -105,12 +114,22 @@ impl PeerDelay {
                 // Two-step responder: t2 in Pdelay_Resp, t3 in Pdelay_Resp_Follow_Up.
                 let resp = builder.pdelay_resp(seq, &source, t_rx);
                 let fallback = clock.now();
+                // Without a hardware t3 the requester's link delay and rate
+                // ratio would be µs off: no Follow_Up then (it retries).
                 let (resp_ok, t3) = match sock.send_stamped(&resp) {
-                    Ok(raw) => (true, stamp_to_tai(raw, sock, clock).unwrap_or(fallback)),
-                    Err(_) => (false, fallback),
+                    Ok(raw) if tx_stamp_missed(sock, &raw) => {
+                        state.lock().unwrap().counters.tx_stamp_missed += 1;
+                        (true, None)
+                    }
+                    Ok(raw) => (
+                        true,
+                        Some(stamp_to_tai(raw, sock, clock).unwrap_or(fallback)),
+                    ),
+                    Err(_) => (false, None),
                 };
-                let fup = builder.pdelay_resp_fup(seq, &source, t3);
-                let _ = resp_ok && sock.send(&fup).is_ok();
+                if let Some(t3) = t3 {
+                    let _ = sock.send(&builder.pdelay_resp_fup(seq, &source, t3));
+                }
                 let mut st = state.lock().unwrap();
                 st.counters.pdelay_req_rx += 1;
                 if resp_ok {

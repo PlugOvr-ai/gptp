@@ -107,6 +107,12 @@ pub fn stamp_to_tai(
     }
 }
 
+/// Hardware timestamping is on, but this transmit got no hardware stamp
+/// (late, dropped by the driver, or only a software one).
+pub fn tx_stamp_missed(sock: &RawSock, raw: &Option<RawStamp>) -> bool {
+    sock.is_hardware_ts() && !raw.is_some_and(|s| s.hardware)
+}
+
 /// A packet timestamp on a free-running local timebase that is never stepped
 /// or slewed: the raw PHC for hardware stamps, CLOCK_MONOTONIC_RAW otherwise
 /// (software stamps are shifted from CLOCK_REALTIME by a fresh sample pair).

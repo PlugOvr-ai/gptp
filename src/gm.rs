@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::clock::{stamp_to_tai, TaiClock};
+use crate::clock::{stamp_to_tai, tx_stamp_missed, TaiClock};
 use crate::config::Config;
 use crate::gmclock;
 use crate::net::RawSock;
@@ -179,14 +179,32 @@ pub fn run(
                 let sync = builder.sync(seq_sync, cfg.log_sync_interval);
                 // Two-step: the Sync's transmit timestamp (hardware if
                 // available) becomes the Follow_Up's preciseOriginTimestamp.
-                // Fall back to a clock sample taken right before the send.
+                // Software mode falls back to a clock sample taken right
+                // before the send; hardware mode never sends such a guess
+                // (µs off) — like ptp4l, that Sync gets no Follow_Up.
                 let fallback = clock.now();
                 let (sync_ok, origin) = match sock.send_stamped(&sync) {
-                    Ok(raw) => (true, stamp_to_tai(raw, &sock, &clock).unwrap_or(fallback)),
-                    Err(_) => (false, fallback),
+                    Ok(raw) if tx_stamp_missed(&sock, &raw) => {
+                        let mut st = state.lock().unwrap();
+                        st.counters.tx_stamp_missed += 1;
+                        if st.counters.tx_stamp_missed == 1 {
+                            st.log(
+                                "WARNING: a Sync got no hardware transmit timestamp within \
+                                 20 ms — its Follow_Up was not sent; see \"TX hw stamp missed\"",
+                            );
+                        }
+                        (true, None)
+                    }
+                    Ok(raw) => (
+                        true,
+                        Some(stamp_to_tai(raw, &sock, &clock).unwrap_or(fallback)),
+                    ),
+                    Err(_) => (false, None),
                 };
-                let fup = builder.follow_up(seq_sync, origin, cfg.log_sync_interval);
-                let fup_ok = sync_ok && sock.send(&fup).is_ok();
+                let fup_ok = origin.is_some_and(|o| {
+                    sock.send(&builder.follow_up(seq_sync, o, cfg.log_sync_interval))
+                        .is_ok()
+                });
                 seq_sync = seq_sync.wrapping_add(1);
                 {
                     let mut st = state.lock().unwrap();

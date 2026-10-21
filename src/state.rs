@@ -153,6 +153,10 @@ pub struct Counters {
     pub pdelay_req_tx: u64,
     pub announce_rx: u64,
     pub foreign_sync_rx: u64,
+    /// Sent event messages (Sync, Pdelay) without a hardware transmit
+    /// stamp although hardware timestamping is on: their time was taken
+    /// from a clock reading instead (µs error).
+    pub tx_stamp_missed: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

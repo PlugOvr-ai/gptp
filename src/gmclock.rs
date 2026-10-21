@@ -184,7 +184,7 @@ impl Discipline {
             master_stepped: false,
         });
         let desc = format!(
-            "NIC clock {} ← system clock ({} {}, {:+.0} ppb)",
+            "{} ← sys clock: {} {} {:+.0}ppb",
             self.device,
             self.servo.state.label(),
             fmt_ns(off),

@@ -193,10 +193,11 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
                 }
             }
             println!(
-                "status: {role} ts={ts} announce_tx={} sync_tx={} pdelay_answered={} \
+                "status: {role} ts={ts} announce_tx={} sync_tx={} tx_stamp_missed={} pdelay_answered={} \
                  foreign_masters={} nodes={} link_delay={}",
                 st.counters.announce_tx,
                 st.counters.sync_tx,
+                st.counters.tx_stamp_missed,
                 st.counters.pdelay_resp_tx,
                 st.foreign_masters.len(),
                 st.nodes.len(),
