@@ -238,7 +238,7 @@ every correction reaches the network. `--ntp-once` sets the clock once, then fre
 ```
 # wait for the router, then the internet, set the clock by NTP once, stop NTP, start the GM
 curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.sh | sudo sh -s -- eth0 --handover 15 \
-    --ntp-once 192.168.1.1 [--internet-check 1.1.1.1,google.com]
+    --ntp-once 192.168.1.1 --internet-check 1.1.1.1,google.com
 ```
 
 Before the grandmaster starts, a prep script (`ExecStartPre`) waits until the router answers, then
