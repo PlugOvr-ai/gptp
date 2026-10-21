@@ -231,6 +231,26 @@ curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.s
     --time-sync linuxptp --sync-phc mgbe3_0
 ```
 
+**Grandmaster on a machine without a battery-backed RTC** (e.g. a Raspberry Pi): the system clock is
+wrong at boot, and keeping NTP running would step or slew the clock while the grandmaster serves —
+every correction reaches the network. `--ntp-once` sets the clock once, then freezes it:
+
+```
+# wait for the router, then the internet, set the clock by NTP once, stop NTP, start the GM
+curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.sh | sudo sh -s -- eth0 --handover 15 \
+    --ntp-once 192.168.1.1 [--internet-check 1.1.1.1,google.com]
+```
+
+Before the grandmaster starts, a prep script (`ExecStartPre`) waits until the router answers, then
+until the internet hosts answer (default `1.1.1.1,google.com`, which also proves DNS), starts
+`systemd-timesyncd` until the clock is synchronized, stops it again, and writes the time to the RTC
+(`hwclock -w`, so a reboot starts with a sane clock; with an RTC battery, so does a cold boot).
+`systemd-timesyncd` is disabled at boot and only ever run by this script; its previous state is
+recorded and restored by `--uninstall gm`. The wait is bounded by `GM_PREP_MAX_WAIT` in the unit
+(default 600 s, `0` = forever) — on expiry the grandmaster starts anyway with an unsynced clock and
+a `WARNING` in the journal, on the principle that a GM with the wrong time beats no GM. Check with
+`journalctl -b -t gm-time-prep`. Not combinable with `--time-sync` (there the master sets the clock).
+
 With `--time-sync` the installer runs `--setup-time-sync` (disabling
 conflicting time services, recorded) and gives the service
 `CAP_SYS_TIME` for `builtin`; `--uninstall` undoes the setup and
@@ -346,6 +366,9 @@ restart the service, so a reinstall picks up new code and arguments.
 
 ## Time and timestamping notes
 
+- On a Pi without an RTC battery, `--ntp-once` (see Install) sets the clock
+  from NTP once at boot andthen freezes it, so no NTP step or slew ever reaches
+  the slaves.
 - PTP uses the TAI timescale. If the kernel's TAI offset is configured (e.g.
   by chrony's `leapsectz right/UTC`), it is used directly; otherwise the
   program falls back to `CLOCK_REALTIME` plus `--utc-offset` (37 s since
