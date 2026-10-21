@@ -6,20 +6,32 @@
 # Install and set up the systemd service in one step — the network interface
 # first, then gptp-gm options (--no-tui is added automatically):
 #
-#   curl -fsSL .../install.sh | sudo sh -s -- eth0 --handover 15        # grandmaster: gptp-gm.service
+#   curl -fsSL .../install.sh | sudo sh -s -- eth0 --handover 15      # grandmaster: gptp-gm.service
 #   curl -fsSL .../install.sh | sudo sh -s -- eth0 --monitor \
-#        --log-metrics /var/log/gptp/monitor.jsonl --capture-dir /var/log/gptp/captures
-#                                                                        # slave monitor: gptp-monitor.service
-#   curl -fsSL .../install.sh | sudo sh -s -- --uninstall [gm|monitor]   # remove service(s); binary when unused
+#       --log-metrics /var/log/gptp/monitor.jsonl --capture-dir /var/log/gptp/captures
+#                                                                  # slave monitor: gptp-monitor.service
+#   curl -fsSL .../install.sh | sudo sh -s -- --uninstall [gm|monitor]  # remove service(s); binary when unused
+#
+# Grandmaster on a machine without a (battery-backed) RTC — set the clock once
+# by NTP at boot, then freeze it so NTP steps/slews never reach the network:
+#
+#   ... | sudo sh -s -- eth0 --handover 15 --ntp-once 192.168.1.1 [--internet-check 1.1.1.1,google.com]
+#       before the grandmaster starts, waits for the router, then for the
+#       internet hosts (default 1.1.1.1,google.com — also proves DNS), starts
+#       systemd-timesyncd until the clock is set, stops it again, writes the
+#       RTC. systemd-timesyncd is disabled at boot (recorded; --uninstall
+#       restores it). GM_PREP_MAX_WAIT=<s> in the unit's Environment= bounds
+#       the wait (default 600; 0 = forever) — on expiry the grandmaster starts
+#       with an unsynced clock and a WARNING in the journal.
 #
 # Slave monitor that also keeps this machine's time in sync with the master:
 #
 #   ... | sudo sh -s -- eth0 --monitor --time-sync builtin [--sync-phc eth1]
-#        gptp-gm disciplines the NIC hardware clock, the system clock and
-#        further NIC clocks itself (replaces ptp4l + phc2sys)
+#       gptp-gm disciplines the NIC hardware clock, the system clock and
+#       further NIC clocks itself (replaces ptp4l + phc2sys)
 #   ... | sudo sh -s -- mgbe0_0 --monitor --time-sync linuxptp [--sync-phc mgbe3_0]
-#        sets up ptp4l + phc2sys (needs linuxptp installed); gptp-gm
-#        monitors listen-only beside it
+#       sets up ptp4l + phc2sys (needs linuxptp installed); gptp-gm
+#       monitors listen-only beside it
 #
 # Both disable conflicting time services (systemd-timesyncd, chrony, ntpd,
 # other ptp4l/phc2sys); --uninstall restores them.
@@ -31,12 +43,16 @@
 # /usr/local/bin, GPTP_DOWNLOAD_URL to download the release files from a
 # mirror instead of GitHub, GPTP_BINARY=<file> to install a local binary
 # instead of downloading (used by scripts/install-service.sh).
+
 set -eu
 
 REPO="PlugOvr-ai/gptp"
 VERSION="${GPTP_VERSION:-latest}"
 BIN_DIR="${GPTP_BIN_DIR:-/usr/local/bin}"
 BIN="$BIN_DIR/gptp-gm"
+PREP="$BIN_DIR/gm-time-prep.sh"
+STATE_DIR=/etc/gptp-gm
+NTP_ONCE_STATE="$STATE_DIR/ntp-once.state"
 UNIT_DIR=/etc/systemd/system
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -56,7 +72,19 @@ fi
 have_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
 unit_path() { echo "$UNIT_DIR/$1.service"; }
 
+# Undo --ntp-once: restore systemd-timesyncd as it was, remove the prep script.
+remove_ntp_once() {
+    [ -e "$NTP_ONCE_STATE" ] || return 0
+    if grep -qs '^timesyncd=enabled$' "$NTP_ONCE_STATE"; then
+        $SUDO systemctl enable --now systemd-timesyncd.service 2>/dev/null || true
+        say "Re-enabled systemd-timesyncd"
+    fi
+    $SUDO rm -f "$NTP_ONCE_STATE" "$PREP"
+    $SUDO rmdir "$STATE_DIR" 2>/dev/null || true
+}
+
 # --- Uninstall -------------------------------------------------------------------------------
+
 if [ "${1:-}" = "--uninstall" ]; then
     case "${2:-all}" in
         gm) remove="gptp-gm" ;;
@@ -66,10 +94,13 @@ if [ "${1:-}" = "--uninstall" ]; then
     esac
     case " $remove " in
         *" gptp-monitor "*)
-            if [ -e /etc/gptp-gm/time-sync.state ] && [ -x "$BIN" ]; then
+            if [ -e "$STATE_DIR/time-sync.state" ] && [ -x "$BIN" ]; then
                 $SUDO "$BIN" --remove-time-sync || say "warning: undoing the time sync setup failed"
             fi
             ;;
+    esac
+    case " $remove " in
+        *" gptp-gm "*) remove_ntp_once ;;
     esac
     for svc in $remove; do
         if [ -e "$(unit_path "$svc")" ]; then
@@ -89,6 +120,7 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 # --- Arguments for the service (validated before downloading anything) ----------------------
+
 IFACE=""
 if [ $# -gt 0 ]; then
     IFACE="$1"
@@ -96,12 +128,15 @@ if [ $# -gt 0 ]; then
     case "$IFACE" in -*) die "the first argument must be the network interface (e.g. eth0), got $IFACE" ;; esac
     have_systemd || die "no systemd here: install without arguments and run gptp-gm $IFACE ... yourself"
 fi
+
 MONITOR=0
 METRICS_FILE=""
 CAPTURE_DIR=""
 TIME_SYNC=""
 SYNC_PHCS=""
 SETUP_EXTRA=""
+NTP_ONCE=""
+INTERNET_CHECK=""
 prev=""
 for arg in "$@"; do
     case "$prev" in
@@ -109,6 +144,8 @@ for arg in "$@"; do
         --capture-dir) CAPTURE_DIR="$arg" ;;
         --time-sync) TIME_SYNC="$arg" ;;
         --sync-phc) SYNC_PHCS="$SYNC_PHCS $arg" ;;
+        --ntp-once) NTP_ONCE="$arg" ;;
+        --internet-check) INTERNET_CHECK="$arg" ;;
         --utc-offset | --neighbor-prop-delay-thresh) SETUP_EXTRA="$SETUP_EXTRA $prev $arg" ;;
     esac
     case "$arg" in
@@ -117,6 +154,8 @@ for arg in "$@"; do
         --capture-dir=*) CAPTURE_DIR="${arg#--capture-dir=}" ;;
         --time-sync=*) TIME_SYNC="${arg#--time-sync=}" ;;
         --sync-phc=*) SYNC_PHCS="$SYNC_PHCS ${arg#--sync-phc=}" ;;
+        --ntp-once=*) NTP_ONCE="${arg#--ntp-once=}" ;;
+        --internet-check=*) INTERNET_CHECK="${arg#--internet-check=}" ;;
         --utc-offset=* | --neighbor-prop-delay-thresh=*) SETUP_EXTRA="$SETUP_EXTRA $arg" ;;
         *" "*) die "arguments with spaces are not supported in the service command line: $arg" ;;
     esac
@@ -129,7 +168,17 @@ case "$TIME_SYNC" in
     *) die "--time-sync takes builtin or linuxptp, got $TIME_SYNC" ;;
 esac
 [ -z "$TIME_SYNC" ] || [ "$MONITOR" -eq 1 ] || die "--time-sync needs --monitor"
-# The service command line: phc2sys does the --sync-phc work with linuxptp.
+[ -z "$NTP_ONCE" ] || [ -z "$TIME_SYNC" ] || die "--ntp-once cannot be combined with --time-sync (the master sets the clock there)"
+[ -z "$INTERNET_CHECK" ] || [ -n "$NTP_ONCE" ] || die "--internet-check needs --ntp-once"
+case "$NTP_ONCE" in
+    "" | *[!0-9a-zA-Z.:_-]*) [ -z "$NTP_ONCE" ] || die "--ntp-once takes the router's IP or hostname, got $NTP_ONCE" ;;
+esac
+case "$INTERNET_CHECK" in
+    *[!0-9a-zA-Z.:_,-]*) die "--internet-check takes a comma-separated list of hosts, got $INTERNET_CHECK" ;;
+esac
+
+# The service command line: phc2sys does the --sync-phc work with linuxptp;
+# --ntp-once / --internet-check are installer options, not gptp-gm options.
 SERVICE_ARGS=""
 skip=0
 for arg in "$@"; do
@@ -137,6 +186,10 @@ for arg in "$@"; do
         skip=0
         continue
     fi
+    case "$arg" in
+        --ntp-once | --internet-check) skip=1 && continue ;;
+        --ntp-once=* | --internet-check=*) continue ;;
+    esac
     if [ "$TIME_SYNC" = linuxptp ]; then
         case "$arg" in
             --sync-phc) skip=1 && continue ;;
@@ -145,6 +198,7 @@ for arg in "$@"; do
     fi
     SERVICE_ARGS="$SERVICE_ARGS $arg"
 done
+
 for path in "$METRICS_FILE" "$CAPTURE_DIR"; do
     case "$path" in
         "" | /*) ;;
@@ -155,6 +209,7 @@ done
 # --- Proxy -----------------------------------------------------------------------------------
 # `curl ... | sudo sh` loses the caller's environment (sudo resets it), so also look where
 # proxies are configured system-wide. Only the downloads below use it.
+
 PROXY="" PROXY_FROM="" NOPROXY=""
 proxy_in_file() { # $1 = variable name pattern, $2... = files
     pattern="$1"
@@ -223,6 +278,7 @@ if [ -n "$PROXY" ] && [ -z "${GPTP_BINARY:-}" ]; then
 fi
 
 # --- Binary ----------------------------------------------------------------------------------
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
@@ -285,13 +341,14 @@ if [ -z "$IFACE" ]; then
         say "Restarted:$restarted"
     else
         echo
-        echo "Next: run it with the TUI            sudo gptp-gm eth0 [--handover 15 | --monitor]"
-        echo "      or install it as a service     curl -fsSL https://github.com/$REPO/releases/latest/download/install.sh | sudo sh -s -- eth0 [options]"
+        echo "Next: run it with the TUI       sudo gptp-gm eth0 [--handover 15 | --monitor]"
+        echo "  or install it as a service    curl -fsSL https://github.com/$REPO/releases/latest/download/install.sh | sudo sh -s -- eth0 [options]"
     fi
     exit 0
 fi
 
 # --- Time sync (one-shot system configuration) ------------------------------------------------
+
 if [ -n "$TIME_SYNC" ]; then
     setup_args=""
     for phc in $SYNC_PHCS; do setup_args="$setup_args --sync-phc $phc"; done
@@ -301,7 +358,111 @@ if [ -n "$TIME_SYNC" ]; then
         || die "time sync setup failed (see above)"
 fi
 
+# --- NTP once at boot (grandmaster without a battery-backed RTC) ------------------------------
+# The prep script runs as ExecStartPre=+ (full privileges, outside the unit's
+# sandbox): wait for the router, then the internet, set the clock once with
+# systemd-timesyncd, stop it, write the RTC — then the grandmaster starts.
+
+if [ -n "$NTP_ONCE" ]; then
+    say "Configuring NTP-once at boot (router $NTP_ONCE, internet check ${INTERNET_CHECK:-1.1.1.1,google.com})..."
+    command -v hwclock >/dev/null 2>&1 \
+        || say "warning: hwclock not found - the RTC will not be written (Debian/Ubuntu: apt install util-linux-extra)"
+    $SUDO tee "$TMP/gm-time-prep.sh" >/dev/null <<'EOF'
+#!/bin/sh
+# gm-time-prep.sh — gate for the gPTP grandmaster service (ExecStartPre).
+# Installed by gptp-gm's install.sh (--ntp-once); see https://github.com/PlugOvr-ai/gptp
+#
+#   gm-time-prep.sh <router-ip> [internet-host ...]
+#
+# Waits for the router, then for the internet hosts (default 1.1.1.1 and
+# google.com, which also proves DNS), then starts systemd-timesyncd so the
+# system clock is set once by NTP, stops it again so nothing steps or slews
+# the clock while the grandmaster serves, and writes the time to the RTC
+# for the next boot. Always exits 0: a prep failure starts the GM unsynced
+# with a WARNING in the journal rather than no GM at all.
+#
+# Environment: GM_PREP_MAX_WAIT=<s> overall budget (default 600, 0 = forever).
+
+set -u
+
+ROUTER="${1:?usage: gm-time-prep.sh <router-ip> [internet-host ...]}"
+shift
+[ $# -gt 0 ] || set -- 1.1.1.1 google.com
+MAX_WAIT="${GM_PREP_MAX_WAIT:-600}"
+TAG=gm-time-prep
+
+log() {
+    logger -t "$TAG" "$*" 2>/dev/null
+    echo "$TAG: $*"
+}
+up() { ping -c1 -W2 "$1" >/dev/null 2>&1; }
+uptime_s() { cut -d. -f1 /proc/uptime; }     # monotonic: unaffected by the NTP step
+start=$(uptime_s)
+elapsed() { echo $(( $(uptime_s) - start )); }
+expired() {
+    [ "$MAX_WAIT" -gt 0 ] || return 1
+    [ "$(elapsed)" -ge "$MAX_WAIT" ]
+}
+all_up() {
+    for h in "$@"; do up "$h" || return 1; done
+}
+give_up() {
+    systemctl stop systemd-timesyncd.service 2>/dev/null
+    log "WARNING: $1 — starting the grandmaster with an unsynced clock"
+    exit 0
+}
+
+# 1. router
+until up "$ROUTER"; do
+    expired && give_up "router $ROUTER not reachable within ${MAX_WAIT}s"
+    sleep 2
+done
+log "router $ROUTER reachable"
+
+# 2. internet + DNS
+until all_up "$@"; do
+    expired && give_up "internet/DNS check ($*) failed within ${MAX_WAIT}s"
+    sleep 3
+done
+log "internet reachable ($*)"
+
+# 3. NTP — started only now, so its first poll happens immediately
+systemctl start systemd-timesyncd.service
+until [ "$(timedatectl show -p NTPSynchronized --value)" = yes ]; do
+    expired && give_up "NTP did not sync within ${MAX_WAIT}s"
+    sleep 2
+done
+
+# 4. freeze the clock, seed the RTC
+systemctl stop systemd-timesyncd.service
+if command -v hwclock >/dev/null 2>&1 && hwclock -w 2>/dev/null; then
+    rtc="RTC written"
+else
+    rtc="RTC not written (no hwclock or no RTC)"
+fi
+log "clock set by NTP at $(date -u +%FT%TZ) after $(elapsed)s, timesyncd stopped, $rtc — starting the grandmaster"
+exit 0
+EOF
+    $SUDO install -m 0755 "$TMP/gm-time-prep.sh" "$PREP"
+    # Record timesyncd's enable state once (not on reinstall), then keep it off at boot:
+    # the prep script starts and stops it itself.
+    if [ ! -e "$NTP_ONCE_STATE" ]; then
+        if $SUDO systemctl is-enabled systemd-timesyncd.service >/dev/null 2>&1; then
+            was=enabled
+        else
+            was=disabled
+        fi
+        $SUDO mkdir -p "$STATE_DIR"
+        echo "timesyncd=$was" | $SUDO tee "$NTP_ONCE_STATE" >/dev/null
+    fi
+    $SUDO systemctl disable --now systemd-timesyncd.service 2>/dev/null || true
+elif [ "$MONITOR" -eq 0 ]; then
+    # GM reinstalled without --ntp-once: undo an earlier --ntp-once setup.
+    remove_ntp_once
+fi
+
 # --- Service ---------------------------------------------------------------------------------
+
 if [ "$MONITOR" -eq 1 ]; then
     SERVICE=gptp-monitor OTHER=gptp-gm OTHER_ARG=gm DESCRIPTION="gPTP slave monitor on $IFACE"
 else
@@ -331,6 +492,16 @@ if [ -n "$RW_DIRS" ]; then
     RW_LINE="ReadWritePaths=$RW_DIRS"
 fi
 
+# --ntp-once: the prep script may wait minutes for the router/internet, so the
+# start timeout must not kill it; "+" runs it with full privileges outside the
+# sandbox (it needs systemctl, hwclock and /dev/rtc).
+PREP_LINES=""
+if [ -n "$NTP_ONCE" ]; then
+    PREP_LINES="TimeoutStartSec=infinity
+Environment=GM_PREP_MAX_WAIT=600
+ExecStartPre=+$PREP $NTP_ONCE $(printf '%s' "$INTERNET_CHECK" | tr ',' ' ')"
+fi
+
 $SUDO tee "$UNIT" >/dev/null <<EOF
 [Unit]
 Description=$DESCRIPTION
@@ -341,6 +512,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=$BIN $IFACE --no-tui$SERVICE_ARGS
+$PREP_LINES
 # Runs as root for /dev/ptp* (PTP hardware clock) access, with capabilities
 # bounded to raw sockets + NIC timestamping configuration (+ setting clocks
 # with --time-sync builtin).
@@ -361,12 +533,12 @@ $SUDO systemctl daemon-reload
 $SUDO systemctl enable "$SERVICE" >/dev/null 2>&1
 # restart, not start: a reinstall must pick up the new binary and arguments.
 $SUDO systemctl restart "$SERVICE"
-
 echo
 $SUDO systemctl --no-pager --lines 0 status "$SERVICE" || true
 echo
 say "Installed $SERVICE.service"
-echo "logs:      journalctl -fu $SERVICE"
-[ -z "$METRICS_FILE" ] || echo "metrics:   $METRICS_FILE"
-[ -z "$CAPTURE_DIR" ] || echo "captures:  $CAPTURE_DIR"
-echo "remove:    curl -fsSL https://github.com/$REPO/releases/latest/download/install.sh | sudo sh -s -- --uninstall $([ "$MONITOR" -eq 1 ] && echo monitor || echo gm)"
+echo "logs:     journalctl -fu $SERVICE"
+[ -z "$NTP_ONCE" ] || echo "prep:     journalctl -b -t gm-time-prep   (router -> internet -> NTP -> frozen)"
+[ -z "$METRICS_FILE" ] || echo "metrics:  $METRICS_FILE"
+[ -z "$CAPTURE_DIR" ] || echo "captures: $CAPTURE_DIR"
+echo "remove:   curl -fsSL https://github.com/$REPO/releases/latest/download/install.sh | sudo sh -s -- --uninstall $([ "$MONITOR" -eq 1 ] && echo monitor || echo gm)"
