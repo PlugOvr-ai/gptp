@@ -31,18 +31,34 @@ pub fn run(iface: String, state: Arc<Mutex<Status>>, quit: Arc<AtomicBool>) {
     let mut last: HashMap<&'static str, u64> = HashMap::new();
     let mut last_alarm: HashMap<&'static str, Instant> = HashMap::new();
     let mut first = true;
+    let mut last_at = Instant::now();
 
     while !quit.load(Ordering::SeqCst) {
         let mut health = LinkHealth::default();
+        let now = Instant::now();
+        let secs = now.duration_since(last_at).as_secs_f64().max(0.1);
+        last_at = now;
+        // Some drivers' counters glitch (read low for a moment, or are
+        // rebuilt from hardware registers); a byte delta beyond what the
+        // link can carry is such a glitch, not traffic.
+        let max_bytes = read_speed_mbps(&iface).map(|m| m as f64 * 1e6 / 8.0 * secs * 2.0);
         for name in RATE_COUNTERS {
-            let total = read_counter(&iface, name).unwrap_or(0);
-            let delta = total.saturating_sub(*last.get(name).unwrap_or(&total));
+            let Some(total) = read_counter(&iface, name) else {
+                continue;
+            };
+            let limit = if name.ends_with("_bytes") {
+                max_bytes
+            } else {
+                None
+            };
+            let delta = rate_delta(last.get(name).copied(), total, limit);
             last.insert(name, total);
+            let rate = delta as f64 / secs;
             match name {
-                "rx_bytes" => health.rx_bps = delta as f64 * 8.0,
-                "tx_bytes" => health.tx_bps = delta as f64 * 8.0,
-                "rx_packets" => health.rx_pps = delta,
-                "tx_packets" => health.tx_pps = delta,
+                "rx_bytes" => health.rx_bps = rate * 8.0,
+                "tx_bytes" => health.tx_bps = rate * 8.0,
+                "rx_packets" => health.rx_pps = rate.round() as u64,
+                "tx_packets" => health.tx_pps = rate.round() as u64,
                 _ => {}
             }
         }
@@ -102,4 +118,42 @@ fn read_counter(iface: &str, name: &str) -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// Link speed in Mb/s; None when down or unknown (-1).
+fn read_speed_mbps(iface: &str) -> Option<u64> {
+    let v: i64 = std::fs::read_to_string(format!("/sys/class/net/{iface}/speed"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (v > 0).then_some(v as u64)
+}
+
+/// Counter increase since the previous sample. A first sample, a counter
+/// that went backwards (reset or glitch), or an increase beyond `limit`
+/// counts as 0: the new value only becomes the baseline.
+fn rate_delta(prev: Option<u64>, total: u64, limit: Option<f64>) -> u64 {
+    let Some(prev) = prev else { return 0 };
+    let delta = total.saturating_sub(prev);
+    match limit {
+        Some(l) if delta as f64 > l => 0,
+        _ => delta,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_glitch_is_not_traffic() {
+        assert_eq!(rate_delta(None, 1000, None), 0);
+        assert_eq!(rate_delta(Some(1000), 1500, Some(1e6)), 500);
+        // Counter read low once, then back: neither sample is a rate.
+        assert_eq!(rate_delta(Some(60_000_000_000), 5, Some(1e6)), 0);
+        assert_eq!(rate_delta(Some(5), 60_000_000_100, Some(1e6)), 0);
+        // Unknown speed: only the backwards step is caught.
+        assert_eq!(rate_delta(Some(10), 5, None), 0);
+    }
 }
