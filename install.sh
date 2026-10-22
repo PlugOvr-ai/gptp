@@ -24,6 +24,17 @@
 # Both disable conflicting time services (systemd-timesyncd, chrony, ntpd,
 # other ptp4l/phc2sys); --uninstall restores them.
 #
+# Grandmaster without a battery-backed RTC (e.g. Raspberry Pi 5): set the
+# clock once per start from NTP, then freeze it, so no NTP step or slew
+# reaches the network while it serves:
+#
+#   ... | sudo sh -s -- eth0 --ntp-once 192.168.1.1 [--internet-check 1.1.1.1,google.com]
+#        before the grandmaster starts: router reachable → internet + DNS
+#        reachable → systemd-timesyncd until synced → stop it → hwclock -w.
+#        systemd-timesyncd is disabled otherwise (restored by --uninstall gm).
+#        The wait is bounded by GM_PREP_MAX_WAIT (s, default 600, set in the
+#        unit); then the grandmaster starts anyway, with a WARNING.
+#
 # Running it again without arguments updates the binary and restarts the
 # installed services.
 #
@@ -56,6 +67,79 @@ fi
 have_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
 unit_path() { echo "$UNIT_DIR/$1.service"; }
 
+# --- --ntp-once: set the clock once before the grandmaster starts ----------------------------
+GATE="$BIN_DIR/gptp-gm-ntp-once"
+NTP_STATE=/etc/gptp-gm/ntp-once.state
+
+write_gate() {
+    $SUDO tee "$GATE" >/dev/null <<'EOF'
+#!/bin/sh
+# gptp-gm --ntp-once gate (written by install.sh, runs as ExecStartPre=+):
+# set the system clock once from NTP, then stop NTP so the grandmaster
+# serves a clock that no longer steps or slews.
+#
+#   gptp-gm-ntp-once <router> <host,host,...>
+#
+# GM_PREP_MAX_WAIT (s, default 600) bounds the whole wait; on expiry the
+# grandmaster starts anyway - a GM with the wrong time beats no GM.
+ROUTER="$1"
+HOSTS="$(printf '%s' "$2" | tr ',' ' ')"
+MAX_WAIT="${GM_PREP_MAX_WAIT:-600}"
+SYNCED=/run/systemd/timesync/synchronized
+
+# Seconds since boot: the NTP step moves the wall clock, not this.
+uptime_s() { cut -d. -f1 /proc/uptime; }
+DEADLINE=$(($(uptime_s) + MAX_WAIT))
+in_time() { [ "$(uptime_s)" -lt "$DEADLINE" ]; }
+give_up() {
+    systemctl stop systemd-timesyncd 2>/dev/null
+    echo "WARNING: $1 within ${MAX_WAIT}s (GM_PREP_MAX_WAIT) - starting the grandmaster with an unsynced clock: $(date -u '+%F %T UTC')"
+    exit 0
+}
+reachable() { ping -c 1 -W 2 "$1" >/dev/null 2>&1; }
+
+echo "Waiting for the router $ROUTER..."
+until reachable "$ROUTER"; do
+    in_time || give_up "router $ROUTER not reachable"
+    sleep 1
+done
+for h in $HOSTS; do
+    echo "Waiting for $h (internet, DNS)..."
+    until reachable "$h"; do
+        in_time || give_up "$h not reachable"
+        sleep 1
+    done
+done
+echo "Setting the clock with systemd-timesyncd (now $(date -u '+%F %T UTC'))..."
+rm -f "$SYNCED"
+# restart, not start: a running instance may only poll again much later.
+systemctl restart systemd-timesyncd || give_up "systemd-timesyncd did not start"
+until [ -e "$SYNCED" ]; do
+    in_time || give_up "NTP did not sync"
+    sleep 1
+done
+systemctl stop systemd-timesyncd
+echo "Clock set: $(date -u '+%F %T UTC') - NTP stopped, the clock runs free while the grandmaster serves it"
+if { [ -e /dev/rtc0 ] || [ -e /dev/rtc ]; } && command -v hwclock >/dev/null 2>&1; then
+    if hwclock -w; then echo "Saved to the RTC"; else echo "warning: writing the RTC failed"; fi
+fi
+exit 0
+EOF
+    $SUDO chmod 0755 "$GATE"
+}
+
+# Undo --ntp-once: systemd-timesyncd back to how it was before.
+restore_ntp() {
+    [ -e "$NTP_STATE" ] || return 0
+    prev="$(cat "$NTP_STATE")"
+    case "$prev" in
+        enabled) $SUDO systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || say "warning: re-enabling systemd-timesyncd failed" ;;
+        masked) $SUDO systemctl mask systemd-timesyncd >/dev/null 2>&1 || true ;;
+    esac
+    $SUDO rm -f "$NTP_STATE" "$GATE"
+    say "Restored systemd-timesyncd (${prev:-disabled})"
+}
+
 # --- Uninstall -------------------------------------------------------------------------------
 if [ "${1:-}" = "--uninstall" ]; then
     case "${2:-all}" in
@@ -78,6 +162,7 @@ if [ "${1:-}" = "--uninstall" ]; then
             say "Removed $svc service"
         fi
     done
+    case " $remove " in *" gptp-gm "*) restore_ntp ;; esac
     if have_systemd; then $SUDO systemctl daemon-reload; fi
     if [ -e "$(unit_path gptp-gm)" ] || [ -e "$(unit_path gptp-monitor)" ]; then
         say "Kept $BIN (still used by an installed service)"
@@ -102,9 +187,13 @@ CAPTURE_DIR=""
 TIME_SYNC=""
 SYNC_PHCS=""
 SETUP_EXTRA=""
+NTP_ONCE=""
+INTERNET_CHECK=""
 prev=""
 for arg in "$@"; do
     case "$prev" in
+        --ntp-once) NTP_ONCE="$arg" ;;
+        --internet-check) INTERNET_CHECK="$arg" ;;
         --log-metrics) METRICS_FILE="$arg" ;;
         --capture-dir) CAPTURE_DIR="$arg" ;;
         --time-sync) TIME_SYNC="$arg" ;;
@@ -113,6 +202,8 @@ for arg in "$@"; do
     esac
     case "$arg" in
         --monitor) MONITOR=1 ;;
+        --ntp-once=*) NTP_ONCE="${arg#--ntp-once=}" ;;
+        --internet-check=*) INTERNET_CHECK="${arg#--internet-check=}" ;;
         --log-metrics=*) METRICS_FILE="${arg#--log-metrics=}" ;;
         --capture-dir=*) CAPTURE_DIR="${arg#--capture-dir=}" ;;
         --time-sync=*) TIME_SYNC="${arg#--time-sync=}" ;;
@@ -128,8 +219,27 @@ case "$TIME_SYNC" in
     builtin | linuxptp) ;;
     *) die "--time-sync takes builtin or linuxptp, got $TIME_SYNC" ;;
 esac
+GM_PREP_MAX_WAIT="${GM_PREP_MAX_WAIT:-600}"
+if [ -n "$NTP_ONCE" ]; then
+    [ -z "$TIME_SYNC" ] || die "--ntp-once and --time-sync exclude each other: with --time-sync the master sets the clock"
+    [ "$MONITOR" -eq 0 ] || die "--ntp-once is for the grandmaster, not with --monitor"
+    case "$NTP_ONCE" in -*) die "--ntp-once needs the router's address, got $NTP_ONCE" ;; esac
+    INTERNET_CHECK="${INTERNET_CHECK:-1.1.1.1,google.com}"
+    case "$GM_PREP_MAX_WAIT" in "" | *[!0-9]*) die "GM_PREP_MAX_WAIT must be seconds, got $GM_PREP_MAX_WAIT" ;; esac
+    command -v ping >/dev/null 2>&1 || die "--ntp-once needs ping (apt install iputils-ping)"
+    systemctl cat systemd-timesyncd.service >/dev/null 2>&1 \
+        || die "--ntp-once needs systemd-timesyncd, installed and not masked (apt install systemd-timesyncd)"
+    for svc in chrony chronyd ntp ntpd ntpsec openntpd; do
+        if systemctl is-active -q "$svc" 2>/dev/null; then
+            say "warning: $svc is running and keeps adjusting the clock the grandmaster serves - disable it for --ntp-once"
+        fi
+    done
+elif [ -n "$INTERNET_CHECK" ]; then
+    die "--internet-check needs --ntp-once"
+fi
 [ -z "$TIME_SYNC" ] || [ "$MONITOR" -eq 1 ] || die "--time-sync needs --monitor"
-# The service command line: phc2sys does the --sync-phc work with linuxptp.
+# The service command line: phc2sys does the --sync-phc work with linuxptp,
+# the --ntp-once gate the installer's own options.
 SERVICE_ARGS=""
 skip=0
 for arg in "$@"; do
@@ -137,6 +247,10 @@ for arg in "$@"; do
         skip=0
         continue
     fi
+    case "$arg" in
+        --ntp-once | --internet-check) skip=1 && continue ;;
+        --ntp-once=* | --internet-check=*) continue ;;
+    esac
     if [ "$TIME_SYNC" = linuxptp ]; then
         case "$arg" in
             --sync-phc) skip=1 && continue ;;
@@ -273,11 +387,13 @@ $SUDO install -m 0755 "$TMP/gptp-gm" "$BIN"
 say "Installed $("$BIN" --version) to $BIN"
 
 if [ -z "$IFACE" ]; then
-    # Update: restart installed services on the new binary.
+    # Update: restart installed services on the new binary (and gate).
+    [ ! -e "$GATE" ] || write_gate
     restarted=""
     for svc in gptp-gm gptp-monitor; do
         if [ -e "$(unit_path "$svc")" ] && have_systemd; then
-            $SUDO systemctl restart "$svc"
+            # --no-block: the --ntp-once gate may wait minutes for the network.
+            $SUDO systemctl restart --no-block "$svc"
             restarted="$restarted $svc"
         fi
     done
@@ -321,6 +437,26 @@ case "$TIME_SYNC" in
     linuxptp) AFTER_EXTRA=" gptp-ptp4l-$IFACE.service" ;;
 esac
 
+GATE_LINES=""
+if [ -n "$NTP_ONCE" ]; then
+    $SUDO mkdir -p "$(dirname "$NTP_STATE")"
+    # Record the state only once: a reinstall finds timesyncd disabled by us.
+    if [ ! -e "$NTP_STATE" ]; then
+        prev="$(systemctl is-enabled systemd-timesyncd 2>/dev/null || true)"
+        echo "${prev:-disabled}" | $SUDO tee "$NTP_STATE" >/dev/null
+    fi
+    $SUDO systemctl disable --now systemd-timesyncd >/dev/null 2>&1 || true
+    write_gate
+    say "systemd-timesyncd disabled - it only runs once per start of $SERVICE, before it serves"
+    # "+": the gate sets the clock, outside the service's sandbox. The gate
+    # bounds its own wait, so systemd must not cut it short.
+    GATE_LINES="Environment=GM_PREP_MAX_WAIT=$GM_PREP_MAX_WAIT
+ExecStartPre=+$GATE $NTP_ONCE $INTERNET_CHECK
+TimeoutStartSec=infinity"
+elif [ "$MONITOR" -eq 0 ]; then
+    restore_ntp # reinstalled without --ntp-once
+fi
+
 RW_DIRS=""
 [ -z "$METRICS_FILE" ] || RW_DIRS="$(dirname "$METRICS_FILE")"
 [ -z "$CAPTURE_DIR" ] || RW_DIRS="${RW_DIRS:+$RW_DIRS }$CAPTURE_DIR"
@@ -340,6 +476,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+$GATE_LINES
 ExecStart=$BIN $IFACE --no-tui$SERVICE_ARGS
 # Runs as root for /dev/ptp* (PTP hardware clock) access, with capabilities
 # bounded to raw sockets + NIC timestamping configuration (+ setting clocks
@@ -360,13 +497,20 @@ EOF
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable "$SERVICE" >/dev/null 2>&1
 # restart, not start: a reinstall must pick up the new binary and arguments.
-$SUDO systemctl restart "$SERVICE"
+if [ -n "$NTP_ONCE" ]; then
+    $SUDO systemctl restart --no-block "$SERVICE"
+    say "Starting $SERVICE - it serves once the clock is set (journalctl -fu $SERVICE)"
+    sleep 2
+else
+    $SUDO systemctl restart "$SERVICE"
+fi
 
 echo
 $SUDO systemctl --no-pager --lines 0 status "$SERVICE" || true
 echo
 say "Installed $SERVICE.service"
 echo "logs:      journalctl -fu $SERVICE"
+[ -z "$NTP_ONCE" ] || echo "clock:     set once per start via $NTP_ONCE ($INTERNET_CHECK), max wait ${GM_PREP_MAX_WAIT}s"
 [ -z "$METRICS_FILE" ] || echo "metrics:   $METRICS_FILE"
 [ -z "$CAPTURE_DIR" ] || echo "captures:  $CAPTURE_DIR"
 echo "remove:    curl -fsSL https://github.com/$REPO/releases/latest/download/install.sh | sudo sh -s -- --uninstall $([ "$MONITOR" -eq 1 ] && echo monitor || echo gm)"

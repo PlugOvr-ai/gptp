@@ -236,6 +236,28 @@ conflicting time services, recorded) and gives the service
 `CAP_SYS_TIME` for `builtin`; `--uninstall` undoes the setup and
 re-enables the disabled services.
 
+**Grandmaster without a battery-backed RTC** (e.g. a Raspberry Pi 5
+without its battery): it boots with a stale clock (the RTC reads 1970;
+systemd floors it to the last clean shutdown). Leaving NTP running fixes
+that, but then every NTP step or slew reaches the network through the
+grandmaster. `--ntp-once <router>` sets the clock once per start, then
+freezes it:
+
+```sh
+curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.sh | sudo sh -s -- eth0 --ntp-once 192.168.1.1
+```
+
+Before the grandmaster starts, a gate (`ExecStartPre=+`) waits for: router
+reachable → internet + DNS reachable (`--internet-check host,host`, default
+`1.1.1.1,google.com`) → `systemd-timesyncd` synced → stops it → `hwclock -w`.
+`systemd-timesyncd` stays disabled otherwise and only the gate runs it; its
+previous state is recorded in `/etc/gptp-gm/ntp-once.state` and restored by
+`--uninstall gm`. The wait is bounded (`GM_PREP_MAX_WAIT=600` seconds,
+installer environment, written to the unit, counted on `/proc/uptime` so the
+NTP step itself cannot trip it); on expiry the grandmaster starts anyway
+with a WARNING in the journal — a GM with the wrong time beats no GM. Not
+combinable with `--time-sync` (there the master sets the clock).
+
 The installer picks the binary for the CPU, verifies its SHA-256, and
 installs it to `/usr/local/bin/gptp-gm`. Run it again without arguments to
 update — installed services are restarted on the new version.
