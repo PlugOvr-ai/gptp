@@ -352,6 +352,17 @@ impl<C: SystemClock> Servo<C> {
         }
     }
 
+    /// Step the clock and change its frequency from outside the loop (the
+    /// reference moved, e.g. --seed-from-gnss); the loop goes on from there.
+    pub fn shift(&mut self, step_ns: i128, dppb: f64) -> io::Result<()> {
+        self.clock.step_ns(step_ns)?;
+        self.drift_ppb = (self.drift_ppb + dppb).clamp(-self.max_freq, self.max_freq);
+        self.freq_ppb = (self.freq_ppb + dppb).clamp(-self.max_freq, self.max_freq);
+        self.clock.set_freq_ppb(self.freq_ppb)?;
+        self.skip = SKIP_AFTER_STEP;
+        Ok(())
+    }
+
     /// Feed one measurement; returns log lines.
     pub fn sample(&mut self, inp: &ServoInput) -> Vec<String> {
         let mut logs = Vec::new();

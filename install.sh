@@ -189,6 +189,7 @@ SYNC_PHCS=""
 SETUP_EXTRA=""
 NTP_ONCE=""
 INTERNET_CHECK=""
+SEED=0
 prev=""
 for arg in "$@"; do
     case "$prev" in
@@ -202,6 +203,7 @@ for arg in "$@"; do
     esac
     case "$arg" in
         --monitor) MONITOR=1 ;;
+        --seed-from-gnss) SEED=1 ;;
         --ntp-once=*) NTP_ONCE="${arg#--ntp-once=}" ;;
         --internet-check=*) INTERNET_CHECK="${arg#--internet-check=}" ;;
         --log-metrics=*) METRICS_FILE="${arg#--log-metrics=}" ;;
@@ -436,6 +438,8 @@ case "$TIME_SYNC" in
     builtin) CAPS_EXTRA=" CAP_SYS_TIME" ;;
     linuxptp) AFTER_EXTRA=" gptp-ptp4l-$IFACE.service" ;;
 esac
+# --seed-from-gnss sets the system clock from a GNSS master before serving.
+[ "$SEED" -eq 0 ] || CAPS_EXTRA=" CAP_SYS_TIME"
 
 GATE_LINES=""
 if [ -n "$NTP_ONCE" ]; then
@@ -480,7 +484,7 @@ $GATE_LINES
 ExecStart=$BIN $IFACE --no-tui$SERVICE_ARGS
 # Runs as root for /dev/ptp* (PTP hardware clock) access, with capabilities
 # bounded to raw sockets + NIC timestamping configuration (+ setting clocks
-# with --time-sync builtin).
+# with --time-sync builtin or --seed-from-gnss).
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN$CAPS_EXTRA
 NoNewPrivileges=yes
 ProtectSystem=strict

@@ -72,6 +72,23 @@ pub struct Config {
     )]
     pub gm_clock: GmClock,
 
+    /// Before announcing, take the time and frequency from a GNSS-locked
+    /// master already on the network (clockClass 6 or 7, usually behind the
+    /// switch), then take over with our priority — the network stays on
+    /// GNSS time instead of jumping to ours. Sets the system clock (needs
+    /// CAP_SYS_TIME). Gives up after --seed-wait and announces unseeded.
+    #[arg(long, conflicts_with = "monitor")]
+    pub seed_from_gnss: bool,
+
+    /// Seconds to wait for a GNSS-locked master with --seed-from-gnss
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 60.0,
+        requires = "seed_from_gnss"
+    )]
+    pub seed_wait: f64,
+
     /// Monitor: a deviation from the drift model beyond this is a spike
     /// (one sample) or a step (persistent). Default 1000 ns with hardware
     /// timestamps, 250000 ns with software timestamps.

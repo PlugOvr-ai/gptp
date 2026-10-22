@@ -123,14 +123,14 @@ pub enum Anomaly {
 }
 
 #[derive(Clone, Copy)]
-struct Fit {
+pub struct Fit {
     /// Offset at x = 0, ns.
-    a: f64,
+    pub a: f64,
     /// Slope, ns per s = ppb.
-    b: f64,
+    pub b: f64,
     rms: f64,
     /// Robust σ of the residuals (1.4826 × MAD), ns.
-    sigma: f64,
+    pub sigma: f64,
 }
 
 impl Fit {
@@ -489,7 +489,7 @@ impl Analyzer {
 /// RMS residual. Up to ~29% of disturbed samples — path-delay jitter that
 /// stayed inside the jump threshold — cannot bias the slope, so the model
 /// recovers within seconds after a disturbance instead of a whole window.
-fn fit_line(pts: &VecDeque<(f64, f64)>) -> Fit {
+pub fn fit_line(pts: &VecDeque<(f64, f64)>) -> Fit {
     let n = pts.len();
     let mut slopes = Vec::with_capacity(n * (n - 1) / 2);
     for i in 0..n {

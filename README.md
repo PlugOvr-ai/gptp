@@ -329,6 +329,7 @@ Selected options (see `--help` for all):
 | `--log-sync-interval <n>` | -3 | log2 Sync interval (-3 = 8/s) |
 | `--utc-offset <s>` | 37 | UTC→TAI offset when the kernel TAI offset is unset |
 | `--gm-clock <src>` | auto | time source: `phc-disciplined` with hardware timestamps, else `system`; or `phc` (free-running NIC clock) |
+| `--seed-from-gnss` | off | before announcing, take time and frequency from a GNSS-locked master on the network (clockClass 6/7), then take over; `--seed-wait <s>` (60) |
 | `--force-sw-timestamps` | off | skip NIC hardware timestamping even if available |
 | `--scan-subnet <CIDR>` | off | ARP-sweep this subnet (/22../30) to find silent nodes |
 | `--no-inventory` | off | disable node discovery and latency probing |
@@ -387,6 +388,21 @@ restart the service, so a reinstall picks up new code and arguments.
   `PTP_SYS_OFFSET`): where those are only µs-accurate, that noise and every
   NTP adjustment reach the network directly — slaves see µs jitter. Do not
   run `phc2sys` on the same NIC with the phc modes.
+- **Seeding from a GNSS master (`--seed-from-gnss`).** For a network where
+  a GNSS time server sits behind the switch with a lower priority: on start
+  the grandmaster stays silent and listens. Once the current master
+  announces clockClass 6 or 7 (locked to a primary reference such as GNSS,
+  or in holdover within spec), it measures that master's Sync for 8 s
+  (Theil–Sen fit over time and frequency, path delay included) and moves the
+  system clock — and with the phc modes the NIC clock — onto it, then
+  announces with its own priority. The switch changes grandmaster without a
+  time step, and the network keeps GNSS time and rate; afterwards our clock
+  runs free (`--ntp-once` keeps NTP from adjusting it). Degraded masters
+  (class 52, 187, 248, ...) are not used — their time may be seconds off.
+  If none qualifies within `--seed-wait` seconds (default 60), or the clock
+  cannot be set (needs `CAP_SYS_TIME`; the installer adds it), it announces
+  with its current time and logs a WARNING with the measured offset. The TUI
+  shows **SEEDING FROM GNSS MASTER** meanwhile; `g` skips it.
 - **When only software timestamping is available** (e.g. Raspberry Pi 4's
   NIC has no PHC), the program says so clearly: a red **⚠ SW TIMESTAMPS
   ONLY** badge in the TUI title bar and Clock panel, `ts=SW-ONLY(!)` in

@@ -12,6 +12,7 @@ use crate::gmclock;
 use crate::net::RawSock;
 use crate::pdelay::PeerDelay;
 use crate::ptp::{self, AnnounceData, Msg};
+use crate::seed::{self, Seeder};
 use crate::state::{ForeignMaster, Role, Status};
 
 pub enum Cmd {
@@ -51,10 +52,18 @@ pub fn run(
     let sync_interval = log_to_duration(cfg.log_sync_interval);
 
     let start = Instant::now();
-    let mut gm_active = true;
-    let mut handover_at = cfg
-        .handover
-        .map(|m| start + Duration::from_secs_f64(m * 60.0));
+    // --seed-from-gnss: silent until the time is taken from a GNSS master;
+    // the handover countdown starts when announcing does.
+    let mut seeder = cfg
+        .seed_from_gnss
+        .then(|| Seeder::new(start + Duration::from_secs_f64(cfg.seed_wait)));
+    let mut gm_active = seeder.is_none();
+    let handover_from = |t: Instant| cfg.handover.map(|m| t + Duration::from_secs_f64(m * 60.0));
+    let mut handover_at = if gm_active {
+        handover_from(start)
+    } else {
+        None
+    };
 
     {
         let mut st = state.lock().unwrap();
@@ -75,6 +84,14 @@ pub fn run(
             cfg.iface(),
             ptp::fmt_clock_identity(&clock_identity)
         ));
+        if seeder.is_some() {
+            st.role = Role::Seeding;
+            st.log(format!(
+                "Seeding: listening up to {} s for a GNSS-locked master (clockClass 6/7) \
+                 to take the time from before announcing",
+                cfg.seed_wait
+            ));
+        }
         for l in clock_logs {
             st.log(l);
         }
@@ -99,7 +116,8 @@ pub fn run(
     let mut next_announce = start;
     let mut next_sync = start;
     let mut pdelay = PeerDelay::new(start);
-    let mut announced_foreign_takeover = false;
+    // While seeding, the master we listen to is not a handover.
+    let mut announced_foreign_takeover = seeder.is_some();
     let mut rxbuf = [0u8; 1600];
 
     loop {
@@ -138,6 +156,14 @@ pub fn run(
                     }
                 }
             }
+        }
+
+        if gm_active && seeder.take().is_some() {
+            // Activated by hand while seeding.
+            handover_at = handover_at.or_else(|| handover_from(Instant::now()));
+            let mut st = state.lock().unwrap();
+            st.handover_deadline = handover_at;
+            st.log("Seeding skipped: announcing with the current time");
         }
 
         let now = Instant::now();
@@ -248,6 +274,13 @@ pub fn run(
                 let t_rx = stamp_to_tai(stamp, &sock, &clock).unwrap_or_else(|| clock.now());
                 if let Some(msg) = ptp::parse(&rxbuf[..n]) {
                     if !pdelay.handle(&msg, t_rx, &builder, &sock, &clock, &state) {
+                        if let Some(s) = seeder.as_mut() {
+                            let logs = s.handle(&msg, t_rx, pdelay.link_delay_ns, Instant::now());
+                            let mut st = state.lock().unwrap();
+                            for l in logs {
+                                st.log(l);
+                            }
+                        }
                         handle_msg(
                             msg,
                             &clock_identity,
@@ -258,6 +291,55 @@ pub fn run(
                         );
                     }
                 }
+            }
+        }
+
+        if let Some(s) = &seeder {
+            let now = Instant::now();
+            let done = if let Some(seed) = s.ready(now) {
+                let off = seed.offset_at(clock.now().to_ns());
+                let rate = if seed.rate_usable() {
+                    seed.rate_ppb
+                } else {
+                    0.0
+                };
+                let mut st = state.lock().unwrap();
+                match gmclock::apply_seed(&clock, discipline.as_mut(), &sock, off, rate) {
+                    Ok(logs) => {
+                        for l in logs {
+                            st.log(l);
+                        }
+                        st.log(seed::describe(&seed, off));
+                    }
+                    Err(e) => st.log(format!(
+                        "WARNING: seeding from {} failed ({e:#}) — announcing with the \
+                         current time, {} off it ({:+.0} ppb)",
+                        ptp::fmt_clock_identity(&seed.gm.gm_identity),
+                        crate::monitor::fmt_ns(off),
+                        seed.rate_ppb
+                    )),
+                }
+                true
+            } else if now >= s.deadline {
+                state.lock().unwrap().log(format!(
+                    "WARNING: seeding gave up after {} s ({}) — announcing with the current time",
+                    cfg.seed_wait,
+                    s.waiting_for()
+                ));
+                true
+            } else {
+                false
+            };
+            if done {
+                seeder = None;
+                gm_active = true;
+                announced_foreign_takeover = false;
+                next_announce = now;
+                next_sync = now;
+                handover_at = handover_from(now);
+                let mut st = state.lock().unwrap();
+                st.role = Role::ActiveGm;
+                st.handover_deadline = handover_at;
             }
         }
 

@@ -74,6 +74,11 @@ impl TaiClock {
         t.to_ns() - self.offset_secs as i128 * 1_000_000_000 - self.error_ns
     }
 
+    /// The served time is a NIC hardware clock.
+    pub fn is_phc(&self) -> bool {
+        self.phc.is_some()
+    }
+
     pub fn utc_offset(&self) -> i16 {
         self.offset_secs as i16
     }

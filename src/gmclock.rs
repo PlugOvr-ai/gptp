@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::clock::TaiClock;
-use crate::clocksync::{PhcTarget, Servo, ServoInput, SystemClock};
+use crate::clocksync::{Adjtimex, PhcTarget, Servo, ServoInput, SystemClock};
 use crate::config::{Config, GmClock};
 use crate::monitor::fmt_ns;
 use crate::net::RawSock;
@@ -154,6 +154,52 @@ fn median_offset(t: &PhcTarget, clock: TaiClock) -> Option<f64> {
     }
     v.sort_by(f64::total_cmp);
     Some(v[v.len() / 2])
+}
+
+/// Move the served time onto a GNSS master's (--seed-from-gnss): step by
+/// −`off_ns` (served − master) and change the frequency by −`rate_ppb`
+/// unless that is implausible. The system clock is always moved — the
+/// served time in system mode, the PHC's reference in phc-disciplined
+/// mode (needs CAP_SYS_TIME); in phc mode the free-running PHC itself.
+pub fn apply_seed(
+    clock: &TaiClock,
+    discipline: Option<&mut Discipline>,
+    sock: &RawSock,
+    off_ns: f64,
+    rate_ppb: f64,
+) -> Result<Vec<String>> {
+    let mut logs = Vec::new();
+    let step = -(off_ns.round() as i128);
+    let df = -rate_ppb;
+    let mut sys = Adjtimex;
+    let sys_result = (|| -> std::io::Result<()> {
+        sys.step_ns(step)?;
+        let f = sys.freq_ppb()?;
+        sys.set_freq_ppb(f + df)
+    })();
+    let phc_free = clock.is_phc() && discipline.is_none();
+    match sys_result {
+        Ok(()) => {}
+        Err(e) if phc_free => logs.push(format!(
+            "warning: system clock not moved with the NIC clock ({e}) — the served time is right"
+        )),
+        Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+            anyhow::bail!("setting the system clock needs CAP_SYS_TIME")
+        }
+        Err(e) => return Err(e).context("setting the system clock"),
+    }
+    if let Some(d) = discipline {
+        // The PHC follows the system clock: move it along, servo included.
+        d.servo.shift(step, df).context("adjusting the NIC clock")?;
+    } else if phc_free {
+        let index = sock.phc().context("no NIC clock")?.index;
+        let mut phc = PhcTarget::new(PhcClock::open(index)?).context("opening the NIC clock")?;
+        phc.step_ns(step).context("stepping the NIC clock")?;
+        let f = phc.freq_ppb()?;
+        phc.set_freq_ppb(f + df)
+            .context("adjusting the NIC clock")?;
+    }
+    Ok(logs)
 }
 
 impl Discipline {

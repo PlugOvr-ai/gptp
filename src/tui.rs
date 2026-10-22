@@ -186,6 +186,13 @@ fn draw_title(f: &mut Frame, area: Rect, st: &Status) {
                 .bg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
+        Role::Seeding => (
+            "  SEEDING FROM GNSS MASTER  ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Role::Passive => (
             "  PASSIVE — SWITCH IS GM  ",
             Style::default()
@@ -888,6 +895,12 @@ fn draw_foreign_masters(f: &mut Frame, area: Rect, st: &Status) {
                     }
                     (Role::ActiveGm, false) => {
                         Span::styled(" outranked by us", Style::default().fg(Color::Green))
+                    }
+                    (Role::Seeding, _) if crate::seed::gnss_locked(&fm.data) => {
+                        Span::styled(" GNSS-locked: seeding", Style::default().fg(Color::Cyan))
+                    }
+                    (Role::Seeding, _) => {
+                        Span::styled(" not GNSS-locked", Style::default().fg(Color::DarkGray))
                     }
                     (Role::Passive, _) => {
                         Span::styled(" active GM", Style::default().fg(Color::Yellow))

@@ -12,6 +12,7 @@ mod net;
 mod pdelay;
 mod phc;
 mod ptp;
+mod seed;
 mod state;
 mod streams;
 mod syncdiag;
@@ -148,6 +149,7 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
             printed_events = st.events.len().min(200);
             let role = match st.role {
                 Role::ActiveGm => "ACTIVE-GM",
+                Role::Seeding => "SEEDING",
                 Role::Passive => "PASSIVE",
                 Role::Monitor => "MONITOR",
             };

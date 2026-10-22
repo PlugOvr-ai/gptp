@@ -60,6 +60,7 @@ fn snapshot_json(st: &Status) -> String {
         "role",
         match st.role {
             Role::ActiveGm => "active-gm",
+            Role::Seeding => "seeding",
             Role::Passive => "passive",
             Role::Monitor => "monitor",
         },

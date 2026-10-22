@@ -9,6 +9,9 @@ use crate::ptp::AnnounceData;
 pub enum Role {
     /// Actively sending Announce + Sync/Follow_Up.
     ActiveGm,
+    /// --seed-from-gnss: silent, taking the time from a GNSS-locked master
+    /// before announcing.
+    Seeding,
     /// Handed over (or manually stopped): silent except peer-delay responses.
     Passive,
     /// Slave monitor (--monitor): follows the best master and watches its
