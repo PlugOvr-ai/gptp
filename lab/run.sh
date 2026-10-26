@@ -9,6 +9,7 @@
 #      toward the sensors (skipped if the host kernel lacks netem)
 #   2. grandmaster failure: gm stops, gm-backup (1 s off) takes over
 #   3. grandmaster returns
+# Throughout, the GM also serves IEEE 1588 over UDP to ptp-device (ptp4l).
 # Logs, metrics and captures are collected in lab/out/<UTC time>/.
 
 set -euo pipefail
@@ -23,7 +24,7 @@ FAILED=0
 
 collect() {
     "${DC[@]}" logs --no-color --no-log-prefix monitor >"$OUT/monitor.log" 2>&1 || true
-    for svc in gm gm-backup switch; do
+    for svc in gm gm-backup switch ptp-device; do
         "${DC[@]}" logs --no-color --no-log-prefix "$svc" >"$OUT/$svc.log" 2>&1 || true
     done
     "${DC[@]}" cp monitor:/out/. "$OUT/" >/dev/null 2>&1 || true
@@ -36,8 +37,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-check() { # <extended regex> <description>
-    if grep -qE -- "$1" "$OUT/monitor.log"; then
+check() { # <extended regex> <description> [log, default monitor]
+    if grep -qE -- "$1" "$OUT/${3:-monitor}.log"; then
         echo "  ok    $2"
     else
         echo "  FAIL  $2  (no match for /$1/)"
@@ -51,7 +52,7 @@ step() {
 
 step "starting lab (build may take a few minutes the first time)"
 "${DC[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-"${DC[@]}" up -d --build --wait gm gm-backup monitor
+"${DC[@]}" up -d --build --wait gm gm-backup monitor ptp-device
 echo "   monitor learning the master for 20 s"
 sleep 20
 
@@ -92,6 +93,9 @@ if grep -E 'STEP .*during a jitter burst' "$OUT/monitor.log" | grep -qE 'STEP [+
     echo "  FAIL  a GM time step was mislabelled as jitter"
     FAILED=1
 fi
+check 'ptp1588: UDP.* delay_resp_tx=[1-9]' "GM serves IEEE 1588 beside gPTP (Delay_Req answered)" gm
+check 'UNCALIBRATED on RS_SLAVE' "1588 device (ptp4l) follows the GM" ptp-device
+check 'rms +[0-9]+ max' "1588 device measures its offset to the GM" ptp-device
 captures=("$OUT"/captures/sync-*.csv)
 if [[ -f ${captures[0]} ]]; then
     echo "  ok    ${#captures[@]} capture file(s) written"

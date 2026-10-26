@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
-# Image for the gPTP lab: the gptp-gm binary plus iproute2 (ip, tc/netem).
+# Image for the gPTP lab: the gptp-gm binary plus iproute2 (ip, tc/netem)
+# and linuxptp (ptp4l as a plain IEEE 1588 device).
 # Build context is the repository root (see lab/compose.yaml).
 
 FROM rust:1-slim-bookworm AS build
@@ -12,7 +13,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 procps \
+    && apt-get install -y --no-install-recommends iproute2 procps linuxptp \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /gptp-gm /usr/local/bin/gptp-gm
 COPY lab/switch.sh /usr/local/bin/lab-switch

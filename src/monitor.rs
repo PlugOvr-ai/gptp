@@ -638,6 +638,7 @@ pub fn run(
         clock_identity,
         port_number: 1,
         domain: cfg.domain,
+        sdo: ptp::SDO_GPTP,
     };
     let hw = sock.is_hardware_ts();
     let th = Thresholds::new(&cfg, hw);

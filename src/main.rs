@@ -12,6 +12,7 @@ mod net;
 mod pdelay;
 mod phc;
 mod ptp;
+mod ptp1588;
 mod seed;
 mod state;
 mod streams;
@@ -67,7 +68,11 @@ fn main() -> Result<()> {
         .transpose()?
         .unwrap_or_default();
 
-    let sock = net::RawSock::open(cfg.iface(), cfg.force_sw_timestamps)?;
+    let sock = net::RawSock::open(
+        cfg.iface(),
+        cfg.force_sw_timestamps,
+        cfg.ptp == Some(config::PtpTransport::Udp),
+    )?;
     let our_mac = sock.mac;
     let clock = clock::TaiClock::new(cfg.utc_offset).with_error(cfg.time_error);
     let state = Arc::new(Mutex::new(Status::new(cfg.iface().to_string())));
@@ -192,6 +197,27 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
                 }
                 if let Some(l) = &sm.linuxptp_status {
                     println!("linuxptp: {l}");
+                }
+            }
+            if let Some(p) = &st.ptp1588 {
+                match &p.error {
+                    Some(e) => println!("ptp1588: FAILED {e}"),
+                    None => println!(
+                        "ptp1588: {} announce_tx={} sync_tx={} follow_up_tx={} delay_req_rx={} \
+                         delay_resp_tx={} clients={} foreign_masters={}",
+                        p.desc,
+                        p.announce_tx,
+                        p.sync_tx,
+                        p.follow_up_tx,
+                        p.delay_req_rx,
+                        p.delay_resp_tx,
+                        p.clients
+                            .iter()
+                            .map(|c| c.addr.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        p.foreign_masters,
+                    ),
                 }
             }
             println!(

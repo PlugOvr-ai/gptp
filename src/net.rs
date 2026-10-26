@@ -1,5 +1,7 @@
 //! Raw AF_PACKET socket bound to one interface for EtherType 0x88F7 (PTP),
-//! with hardware packet timestamping when the NIC supports it.
+//! with hardware packet timestamping when the NIC supports it. Each socket
+//! serves one multicast address: gPTP's, or 1588-over-Ethernet's (`--ptp
+//! l2`) — both receive every PTP frame, and keep only their own.
 //!
 //! Timestamp modes, best first:
 //!   Hardware  — NIC timestamps frames in the MAC/PHY (SO_TIMESTAMPING raw
@@ -26,6 +28,11 @@ const SOF_TIMESTAMPING_RX_HARDWARE: u32 = 1 << 2;
 const SOF_TIMESTAMPING_RX_SOFTWARE: u32 = 1 << 3;
 const SOF_TIMESTAMPING_SOFTWARE: u32 = 1 << 4;
 const SOF_TIMESTAMPING_RAW_HARDWARE: u32 = 1 << 6;
+pub const TS_HARDWARE_FLAGS: u32 =
+    SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
+pub const TS_SOFTWARE_FLAGS: u32 =
+    SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
+pub const TS_RX_SOFTWARE_FLAGS: u32 = SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
 
 const SIOCETHTOOL: libc::c_ulong = 0x8946;
 /// Minimum Ethernet frame without FCS.
@@ -81,6 +88,8 @@ pub struct RawSock {
     /// at a time — the next Sync's or Pdelay's stamp could be lost.
     gen_fd: RawFd,
     pub mac: [u8; 6],
+    /// The multicast address sent to and accepted.
+    mcast: [u8; 6],
     ts_mode: TsMode,
     ts_desc: String,
 }
@@ -89,7 +98,19 @@ pub struct RawSock {
 pub type Received = (usize, Option<RawStamp>, [u8; 6]);
 
 impl RawSock {
-    pub fn open(ifname: &str, force_software: bool) -> Result<Self> {
+    /// The gPTP socket. `need_l4`: the NIC must also timestamp PTP over
+    /// UDP (--ptp udp beside gPTP).
+    pub fn open(ifname: &str, force_software: bool, need_l4: bool) -> Result<Self> {
+        Self::open_on(ifname, force_software, need_l4, PTP_MCAST)
+    }
+
+    /// A PTP socket for the frames sent to `mcast`.
+    pub fn open_on(
+        ifname: &str,
+        force_software: bool,
+        need_l4: bool,
+        mcast: [u8; 6],
+    ) -> Result<Self> {
         let c_ifname = CString::new(ifname)?;
         let ifindex = unsafe { libc::if_nametoindex(c_ifname.as_ptr()) };
         if ifindex == 0 {
@@ -145,7 +166,7 @@ impl RawSock {
         mreq.mr_ifindex = ifindex as i32;
         mreq.mr_type = libc::PACKET_MR_MULTICAST as u16;
         mreq.mr_alen = 6;
-        mreq.mr_address[..6].copy_from_slice(&PTP_MCAST);
+        mreq.mr_address[..6].copy_from_slice(&mcast);
         let rc = unsafe {
             libc::setsockopt(
                 fd,
@@ -163,11 +184,12 @@ impl RawSock {
         }
 
         let gen_fd = open_general(ifindex).map_err(close_on_err)?;
-        let (ts_mode, ts_desc) = init_timestamping(fd, ifname, force_software);
+        let (ts_mode, ts_desc) = init_timestamping(fd, ifname, force_software, need_l4);
         Ok(RawSock {
             fd,
             gen_fd,
             mac,
+            mcast,
             ts_mode,
             ts_desc,
         })
@@ -188,9 +210,14 @@ impl RawSock {
         &self.ts_desc
     }
 
+    /// For polling several sockets at once (`poll_any`).
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+
     fn frame(&self, payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::with_capacity(14 + payload.len());
-        frame.extend_from_slice(&PTP_MCAST);
+        frame.extend_from_slice(&self.mcast);
         frame.extend_from_slice(&self.mac);
         frame.extend_from_slice(&ETH_P_1588.to_be_bytes());
         frame.extend_from_slice(payload);
@@ -268,6 +295,10 @@ impl RawSock {
                 if pkttype == libc::PACKET_OUTGOING || n < 14 {
                     return Ok(None);
                 }
+                // Another PTP profile's frame (the other socket's).
+                if buf[..6] != self.mcast && buf[..6] != self.mac {
+                    return Ok(None);
+                }
                 let mut src = [0u8; 6];
                 src.copy_from_slice(&buf[6..12]);
                 buf.copy_within(14..n, 0);
@@ -311,32 +342,7 @@ impl RawSock {
         let mut stamp = None;
         let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
         while !cmsg.is_null() {
-            let c = unsafe { &*cmsg };
-            if c.cmsg_level == libc::SOL_SOCKET && c.cmsg_type == SCM_TIMESTAMPING {
-                // struct scm_timestamping { struct timespec ts[3]; }
-                // ts[0] = software, ts[2] = raw hardware
-                let data = unsafe { libc::CMSG_DATA(cmsg) } as *const libc::timespec;
-                let ts = |i: isize| -> Timestamp {
-                    let t = unsafe { *data.offset(i) };
-                    Timestamp {
-                        secs: t.tv_sec as u64,
-                        nanos: t.tv_nsec as u32,
-                    }
-                };
-                let hw = ts(2);
-                let sw = ts(0);
-                if hw.secs != 0 || hw.nanos != 0 {
-                    stamp = Some(RawStamp {
-                        ts: hw,
-                        hardware: true,
-                    });
-                } else if sw.secs != 0 || sw.nanos != 0 {
-                    stamp = Some(RawStamp {
-                        ts: sw,
-                        hardware: false,
-                    });
-                }
-            }
+            stamp = stamp.or(unsafe { cmsg_stamp(cmsg) });
             cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
         }
         Ok(Some((rc as usize, addr.sll_pkttype, stamp)))
@@ -344,21 +350,69 @@ impl RawSock {
 
     /// Wait until the socket is readable or the timeout elapses.
     pub fn poll(&self, timeout_ms: i32) -> Result<bool> {
-        let mut pfd = libc::pollfd {
-            fd: self.fd,
+        Ok(poll_any(&[self.fd], timeout_ms)?[0])
+    }
+}
+
+/// The packet timestamp in an SCM_TIMESTAMPING control message, if `cmsg`
+/// is one.
+///
+/// # Safety
+/// `cmsg` must point at a valid control message.
+pub unsafe fn cmsg_stamp(cmsg: *const libc::cmsghdr) -> Option<RawStamp> {
+    let c = &*cmsg;
+    if c.cmsg_level != libc::SOL_SOCKET || c.cmsg_type != SCM_TIMESTAMPING {
+        return None;
+    }
+    // struct scm_timestamping { struct timespec ts[3]; }
+    // ts[0] = software, ts[2] = raw hardware
+    let data = libc::CMSG_DATA(cmsg) as *const libc::timespec;
+    let ts = |i: isize| -> Timestamp {
+        let t = *data.offset(i);
+        Timestamp {
+            secs: t.tv_sec as u64,
+            nanos: t.tv_nsec as u32,
+        }
+    };
+    let hw = ts(2);
+    let sw = ts(0);
+    if hw.secs != 0 || hw.nanos != 0 {
+        Some(RawStamp {
+            ts: hw,
+            hardware: true,
+        })
+    } else if sw.secs != 0 || sw.nanos != 0 {
+        Some(RawStamp {
+            ts: sw,
+            hardware: false,
+        })
+    } else {
+        None
+    }
+}
+
+/// Wait until one of `fds` is readable or the timeout elapses; which are.
+pub fn poll_any(fds: &[RawFd], timeout_ms: i32) -> Result<Vec<bool>> {
+    let mut pfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
             events: libc::POLLIN,
             revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if rc < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(e).context("polling socket");
+        })
+        .collect();
+    let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::Interrupted {
+            return Ok(vec![false; fds.len()]);
         }
-        Ok(rc > 0 && (pfd.revents & libc::POLLIN) != 0)
+        return Err(e).context("polling sockets");
     }
+    Ok(pfds
+        .iter()
+        .map(|p| rc > 0 && p.revents & libc::POLLIN != 0)
+        .collect())
 }
 
 impl Drop for RawSock {
@@ -410,30 +464,45 @@ fn open_general(ifindex: u32) -> Result<RawFd> {
 }
 
 /// Probe and enable the best available timestamping mode.
-fn init_timestamping(fd: RawFd, ifname: &str, force_software: bool) -> (TsMode, String) {
+fn init_timestamping(
+    fd: RawFd,
+    ifname: &str,
+    force_software: bool,
+    need_l4: bool,
+) -> (TsMode, String) {
     let hw_err = if force_software {
         "disabled by --force-sw-timestamps".to_string()
     } else {
-        match try_enable_hardware(fd, ifname) {
+        match try_enable_hardware(fd, ifname, need_l4) {
             Ok(phc) => {
                 let device = phc.device.clone();
                 return (TsMode::Hardware(phc), format!("hardware ({device})"));
             }
+            // A NIC that stamps only Ethernet PTP: gPTP keeps hardware
+            // stamps, PTP over UDP gets software receive stamps.
+            Err(_) if need_l4 => match try_enable_hardware(fd, ifname, false) {
+                Ok(phc) => {
+                    let device = phc.device.clone();
+                    return (
+                        TsMode::Hardware(phc),
+                        format!("hardware ({device}; Ethernet PTP only, not UDP)"),
+                    );
+                }
+                Err(e) => format!("{e:#}"),
+            },
             Err(e) => format!("{e:#}"),
         }
     };
 
     // Fall back to kernel software timestamps.
-    let sw_flags =
-        SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
-    if set_so_timestamping(fd, sw_flags).is_ok() {
+    if set_so_timestamping(fd, TS_SOFTWARE_FLAGS).is_ok() {
         (TsMode::Software, format!("software — {hw_err}"))
     } else {
         (TsMode::None, format!("clock sampling only — {hw_err}"))
     }
 }
 
-fn try_enable_hardware(fd: RawFd, ifname: &str) -> Result<PhcClock> {
+fn try_enable_hardware(fd: RawFd, ifname: &str, need_l4: bool) -> Result<PhcClock> {
     // 1. Does the NIC advertise hardware timestamping and a PHC?
     let mut info: EthtoolTsInfo = unsafe { std::mem::zeroed() };
     info.cmd = ETHTOOL_GET_TS_INFO;
@@ -454,9 +523,9 @@ fn try_enable_hardware(fd: RawFd, ifname: &str) -> Result<PhcClock> {
     }
 
     // 2. Turn on timestamping in the NIC (needs CAP_NET_ADMIN) — unless it
-    //    already stamps transmitted frames and received gPTP event frames,
-    //    e.g. set up by a ptp4l on the same port: reconfiguring the NIC
-    //    under another PTP stack could disturb it.
+    //    already stamps transmitted frames and received gPTP event frames
+    //    (and UDP ones with `need_l4`), e.g. set up by a ptp4l on the same
+    //    port: reconfiguring the NIC under another PTP stack could disturb it.
     let mut current = HwtstampConfig {
         flags: 0,
         tx_type: 0,
@@ -470,23 +539,29 @@ fn try_enable_hardware(fd: RawFd, ifname: &str) -> Result<PhcClock> {
     )
     .is_ok()
         && current.tx_type == HWTSTAMP_TX_ON
-        && [
+        && ([
             HWTSTAMP_FILTER_ALL,
-            HWTSTAMP_FILTER_PTP_V2_L2_EVENT,
             HWTSTAMP_FILTER_PTP_V2_EVENT,
             HWTSTAMP_FILTER_NTP_ALL,
         ]
-        .contains(&current.rx_filter);
+        .contains(&current.rx_filter)
+            || (!need_l4 && current.rx_filter == HWTSTAMP_FILTER_PTP_V2_L2_EVENT));
     let mut last = if already {
         anyhow::anyhow!("ok")
     } else {
         anyhow::anyhow!("no rx filter accepted")
     };
-    for rx_filter in [
-        HWTSTAMP_FILTER_PTP_V2_L2_EVENT,
-        HWTSTAMP_FILTER_PTP_V2_EVENT,
-        HWTSTAMP_FILTER_ALL,
-    ] {
+    // L2 + UDP event messages when 1588 runs over UDP beside gPTP.
+    let filters: &[i32] = if need_l4 {
+        &[HWTSTAMP_FILTER_PTP_V2_EVENT, HWTSTAMP_FILTER_ALL]
+    } else {
+        &[
+            HWTSTAMP_FILTER_PTP_V2_L2_EVENT,
+            HWTSTAMP_FILTER_PTP_V2_EVENT,
+            HWTSTAMP_FILTER_ALL,
+        ]
+    };
+    for &rx_filter in filters {
         if already {
             break;
         }
@@ -519,11 +594,7 @@ fn try_enable_hardware(fd: RawFd, ifname: &str) -> Result<PhcClock> {
     }
 
     // 3. Request hardware stamps on this socket and open the PHC.
-    set_so_timestamping(
-        fd,
-        SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE,
-    )
-    .context("enabling SO_TIMESTAMPING")?;
+    set_so_timestamping(fd, TS_HARDWARE_FLAGS).context("enabling SO_TIMESTAMPING")?;
     PhcClock::open(info.phc_index)
 }
 
@@ -549,7 +620,7 @@ pub fn phc_index(ifname: &str) -> Result<Option<i32>> {
     Ok((info.so_timestamping & needed == needed && info.phc_index >= 0).then_some(info.phc_index))
 }
 
-fn set_so_timestamping(fd: RawFd, flags: u32) -> io::Result<()> {
+pub fn set_so_timestamping(fd: RawFd, flags: u32) -> io::Result<()> {
     let rc = unsafe {
         libc::setsockopt(
             fd,

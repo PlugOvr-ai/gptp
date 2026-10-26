@@ -190,10 +190,12 @@ SETUP_EXTRA=""
 NTP_ONCE=""
 INTERNET_CHECK=""
 SEED=0
+PTP=""
 prev=""
 for arg in "$@"; do
     case "$prev" in
         --ntp-once) NTP_ONCE="$arg" ;;
+        --ptp) PTP="$arg" ;;
         --internet-check) INTERNET_CHECK="$arg" ;;
         --log-metrics) METRICS_FILE="$arg" ;;
         --capture-dir) CAPTURE_DIR="$arg" ;;
@@ -204,6 +206,7 @@ for arg in "$@"; do
     case "$arg" in
         --monitor) MONITOR=1 ;;
         --seed-from-gnss) SEED=1 ;;
+        --ptp=*) PTP="${arg#--ptp=}" ;;
         --ntp-once=*) NTP_ONCE="${arg#--ntp-once=}" ;;
         --internet-check=*) INTERNET_CHECK="${arg#--internet-check=}" ;;
         --log-metrics=*) METRICS_FILE="${arg#--log-metrics=}" ;;
@@ -440,6 +443,8 @@ case "$TIME_SYNC" in
 esac
 # --seed-from-gnss sets the system clock from a GNSS master before serving.
 [ "$SEED" -eq 0 ] || CAPS_EXTRA=" CAP_SYS_TIME"
+# --ptp udp binds the PTP ports 319/320.
+[ "$PTP" != udp ] || CAPS_EXTRA="$CAPS_EXTRA CAP_NET_BIND_SERVICE"
 
 GATE_LINES=""
 if [ -n "$NTP_ONCE" ]; then
@@ -484,7 +489,7 @@ $GATE_LINES
 ExecStart=$BIN $IFACE --no-tui$SERVICE_ARGS
 # Runs as root for /dev/ptp* (PTP hardware clock) access, with capabilities
 # bounded to raw sockets + NIC timestamping configuration (+ setting clocks
-# with --time-sync builtin or --seed-from-gnss).
+# with --time-sync builtin or --seed-from-gnss, + PTP's UDP ports with --ptp udp).
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN$CAPS_EXTRA
 NoNewPrivileges=yes
 ProtectSystem=strict

@@ -330,6 +330,7 @@ Selected options (see `--help` for all):
 | `--utc-offset <s>` | 37 | UTC→TAI offset when the kernel TAI offset is unset |
 | `--gm-clock <src>` | auto | time source: `phc-disciplined` with hardware timestamps, else `system`; or `phc` (free-running NIC clock) |
 | `--seed-from-gnss` | off | before announcing, take time and frequency from a GNSS-locked master on the network (clockClass 6/7), then take over; `--seed-wait <s>` (60) |
+| `--ptp <udp\|l2>` | off | also serve IEEE 1588 PTP (default profile, E2E) beside gPTP on the same interface; `--ptp-domain` (0), `--ptp-log-sync-interval` (0) |
 | `--force-sw-timestamps` | off | skip NIC hardware timestamping even if available |
 | `--scan-subnet <CIDR>` | off | ARP-sweep this subnet (/22../30) to find silent nodes |
 | `--no-inventory` | off | disable node discovery and latency probing |
@@ -403,6 +404,23 @@ restart the service, so a reinstall picks up new code and arguments.
   cannot be set (needs `CAP_SYS_TIME`; the installer adds it), it announces
   with its current time and logs a WARNING with the measured offset. The TUI
   shows **SEEDING FROM GNSS MASTER** meanwhile; `g` skips it.
+- **IEEE 1588 beside gPTP (`--ptp udp|l2`).** For devices that speak plain
+  PTP but not gPTP, the grandmaster also serves the 1588 default profile
+  on the same interface: two-step Sync/Follow_Up, Announce, and end-to-end
+  delay (it answers Delay_Req) — over UDP/IPv4 (`udp`: 224.0.1.129, ports
+  319/320; unicast Delay_Req is answered unicast) or Ethernet (`l2`:
+  01:1B:19:00:00:00). Same clock, same timestamps, same clock identity
+  (port 2); domain `--ptp-domain` (default 0), priority/class as for gPTP.
+  It is served while gPTP is (not while seeding or handed over). gPTP is
+  unaffected: each socket only takes its own messages, and with `udp` the
+  NIC is told to timestamp UDP PTP too (where it cannot, gPTP keeps
+  hardware stamps and UDP gets software receive stamps). Switches forward
+  1588 messages as ordinary traffic without correcting their residence
+  time, so expect µs rather than ns behind a busy switch. The TUI shows a
+  **PTP (IEEE 1588)** panel with the devices sending Delay_Req; another
+  1588 master in the domain is reported. UDP ports below 1024 need root or
+  `CAP_NET_BIND_SERVICE` (the installer adds it); a ptp4l already serving
+  UDP PTP on the machine blocks them.
 - **When only software timestamping is available** (e.g. Raspberry Pi 4's
   NIC has no PHC), the program says so clearly: a red **⚠ SW TIMESTAMPS
   ONLY** badge in the TUI title bar and Clock panel, `ts=SW-ONLY(!)` in

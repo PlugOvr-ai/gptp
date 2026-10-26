@@ -64,11 +64,12 @@ services:
       interval: 1s
       retries: 30
 
-  # The Pi grandmaster (priority1 1). GM_ARGS adds options, e.g. --handover 1
+  # The Pi grandmaster (priority1 1), also serving IEEE 1588 over UDP for
+  # ptp-device. GM_ARGS adds options, e.g. --handover 1
   gm:
     <<: *node
     networks: [gm_side]
-    command: sh -c "exec gptp-gm eth0 --no-tui $${GM_ARGS:-}"
+    command: sh -c "exec gptp-gm eth0 --no-tui --ptp udp $${GM_ARGS:-}"
     environment:
       GM_ARGS: ${GM_ARGS:-}
 
@@ -90,6 +91,14 @@ services:
       --log-metrics /out/metrics.jsonl --capture-dir /out/captures
     volumes:
       - out:/out
+
+  # A device that speaks only IEEE 1588 (UDP, end-to-end delay), next to the
+  # gPTP monitor: ptp4l as slave, measuring without adjusting the clock.
+  ptp-device:
+    <<: *node
+    networks: [sensor_side]
+    command: >
+      ptp4l -i eth0 -4 -E -S -s -m --free_running 1 --summary_interval 2
 
   # Interactive monitor TUI:
   #   docker compose -f lab/compose.yaml run --rm monitor-tui

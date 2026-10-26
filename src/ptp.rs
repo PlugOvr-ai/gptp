@@ -1,15 +1,25 @@
-//! IEEE 802.1AS (gPTP) message building and parsing.
+//! IEEE 802.1AS (gPTP) message building and parsing, and the IEEE 1588
+//! default-profile messages served beside it (`--ptp`).
 //!
 //! gPTP runs directly over Ethernet (EtherType 0x88F7) to the link-local
-//! multicast address 01:80:C2:00:00:0E, with majorSdoId (transportSpecific) 1.
+//! multicast address 01:80:C2:00:00:0E, with majorSdoId (transportSpecific)
+//! 1. 1588 uses majorSdoId 0, over UDP/IPv4 or Ethernet (01:1B:19:00:00:00).
 
 pub const ETH_P_1588: u16 = 0x88F7;
 pub const PTP_MCAST: [u8; 6] = [0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E];
+/// IEEE 1588 over Ethernet, all messages except peer delay.
+pub const PTP1588_MCAST: [u8; 6] = [0x01, 0x1B, 0x19, 0x00, 0x00, 0x00];
+
+/// majorSdoId (transportSpecific) in the first header byte.
+pub const SDO_GPTP: u8 = 0x10;
+pub const SDO_1588: u8 = 0x00;
 
 pub const MT_SYNC: u8 = 0x0;
+pub const MT_DELAY_REQ: u8 = 0x1;
 pub const MT_PDELAY_REQ: u8 = 0x2;
 pub const MT_PDELAY_RESP: u8 = 0x3;
 pub const MT_FOLLOW_UP: u8 = 0x8;
+pub const MT_DELAY_RESP: u8 = 0x9;
 pub const MT_PDELAY_RESP_FUP: u8 = 0xA;
 pub const MT_ANNOUNCE: u8 = 0xB;
 
@@ -124,6 +134,12 @@ pub enum Msg {
         seq: u16,
         source: [u8; 10],
     },
+    /// 1588 end-to-end delay request (to a master).
+    DelayReq {
+        seq: u16,
+        source: [u8; 10],
+        correction_ns: i64,
+    },
     PdelayResp {
         source: [u8; 10],
         seq: u16,
@@ -225,6 +241,11 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
             })
         }
         MT_PDELAY_REQ => Some(Msg::PdelayReq { seq, source }),
+        MT_DELAY_REQ => Some(Msg::DelayReq {
+            seq,
+            source,
+            correction_ns,
+        }),
         MT_PDELAY_RESP => {
             if length < HDR_LEN + 20 {
                 return None;
@@ -257,11 +278,18 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
     }
 }
 
-/// Builds outgoing gPTP messages for one port.
+/// majorSdoId of a PTP payload: SDO_GPTP or SDO_1588 (or other profiles).
+pub fn sdo(buf: &[u8]) -> Option<u8> {
+    buf.first().map(|b| b & 0xF0)
+}
+
+/// Builds outgoing PTP messages for one port.
 pub struct MsgBuilder {
     pub clock_identity: [u8; 8],
     pub port_number: u16,
     pub domain: u8,
+    /// SDO_GPTP or SDO_1588.
+    pub sdo: u8,
 }
 
 impl MsgBuilder {
@@ -275,7 +303,7 @@ impl MsgBuilder {
         log_interval: i8,
     ) -> Vec<u8> {
         let mut b = vec![0u8; length];
-        b[0] = 0x10 | msg_type; // majorSdoId 1 (gPTP) | messageType
+        b[0] = self.sdo | msg_type; // majorSdoId | messageType
         b[1] = 0x02; // versionPTP 2
         b[2..4].copy_from_slice(&(length as u16).to_be_bytes());
         b[4] = self.domain;
@@ -348,6 +376,37 @@ impl MsgBuilder {
         b
     }
 
+    /// 1588 Follow_Up: no gPTP information TLV.
+    pub fn follow_up_1588(&self, seq: u16, origin: Timestamp, log_sync: i8) -> Vec<u8> {
+        let mut b = self.header(MT_FOLLOW_UP, HDR_LEN + 10, 0, seq, 2, log_sync);
+        origin.write(&mut b[34..44]);
+        b
+    }
+
+    /// 1588 Delay_Resp: when the Delay_Req arrived (t4), and the request's
+    /// correctionField handed back.
+    pub fn delay_resp(
+        &self,
+        req_seq: u16,
+        requesting: &[u8; 10],
+        t4: Timestamp,
+        req_correction_ns: i64,
+        log_min_delay_req: i8,
+    ) -> Vec<u8> {
+        let mut b = self.header(
+            MT_DELAY_RESP,
+            HDR_LEN + 20,
+            0,
+            req_seq,
+            3,
+            log_min_delay_req,
+        );
+        b[8..16].copy_from_slice(&(req_correction_ns << 16).to_be_bytes());
+        t4.write(&mut b[34..44]);
+        b[44..54].copy_from_slice(requesting);
+        b
+    }
+
     pub fn pdelay_req(&self, seq: u16) -> Vec<u8> {
         self.header(MT_PDELAY_REQ, HDR_LEN + 20, 0, seq, 5, 0)
     }
@@ -395,7 +454,63 @@ mod tests {
             clock_identity: [0xAA, 0xBB, 0xCC, 0xFF, 0xFE, 0x01, 0x02, 0x03],
             port_number: 1,
             domain: 0,
+            sdo: SDO_GPTP,
         }
+    }
+
+    #[test]
+    fn ptp1588_messages() {
+        let b = MsgBuilder {
+            sdo: SDO_1588,
+            port_number: 2,
+            domain: 4,
+            ..builder()
+        };
+        let sync = b.sync(5, 0);
+        assert_eq!(sync[0], 0x00);
+        assert_eq!(sync[4], 4);
+        assert_eq!(sdo(&sync), Some(SDO_1588));
+        let fup = b.follow_up_1588(5, Timestamp { secs: 7, nanos: 8 }, 0);
+        assert_eq!(fup.len(), 44);
+        assert_eq!((fup[0], fup[32]), (0x08, 2));
+        match parse(&fup) {
+            Some(Msg::FollowUp {
+                precise_origin,
+                info: None,
+                ..
+            }) => assert_eq!(precise_origin, Timestamp { secs: 7, nanos: 8 }),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // A slave's Delay_Req, answered with its sequence, port and correction.
+        let mut req = MsgBuilder {
+            sdo: SDO_1588,
+            clock_identity: [9; 8],
+            port_number: 1,
+            domain: 4,
+        }
+        .header(MT_DELAY_REQ, HDR_LEN + 10, 0, 77, 1, 0x7F);
+        req[8..16].copy_from_slice(&(12i64 << 16).to_be_bytes());
+        let Some(Msg::DelayReq {
+            seq,
+            source,
+            correction_ns,
+        }) = parse(&req)
+        else {
+            panic!("Delay_Req not parsed")
+        };
+        assert_eq!((seq, correction_ns), (77, 12));
+        let t4 = Timestamp {
+            secs: 100,
+            nanos: 5,
+        };
+        let resp = b.delay_resp(seq, &source, t4, correction_ns, 0);
+        assert_eq!(resp.len(), 54);
+        assert_eq!((resp[0], resp[32], resp[33]), (0x09, 3, 0));
+        assert_eq!(&resp[30..32], &77u16.to_be_bytes());
+        assert_eq!(&resp[8..16], &(12i64 << 16).to_be_bytes());
+        assert_eq!(Timestamp::parse(&resp[34..44]), t4);
+        assert_eq!(&resp[44..54], &source);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::config::TimeSync;
 use crate::gm::Cmd;
 use crate::monitor::fmt_ns;
 use crate::ptp;
-use crate::state::{Role, Status, SyncMonitor, SyncState};
+use crate::state::{Ptp1588Status, Role, Status, SyncMonitor, SyncState};
 
 pub fn run(state: Arc<Mutex<Status>>, cmds: Sender<Cmd>) -> Result<()> {
     let mut terminal = ratatui::init();
@@ -73,6 +73,10 @@ fn draw(f: &mut Frame, st: &Status) {
     if sync_rows > 0 {
         constraints.push(Constraint::Length(sync_rows + 2));
     }
+    let ptp1588 = st.ptp1588.as_ref().filter(|_| monitor.is_none());
+    if ptp1588.is_some() {
+        constraints.push(Constraint::Length(5));
+    }
     constraints.push(Constraint::Min(6));
     constraints.push(Constraint::Length(9));
     constraints.push(Constraint::Length(1));
@@ -98,6 +102,12 @@ fn draw(f: &mut Frame, st: &Status) {
         None
     };
     let time_sync_area = if sync_rows > 0 {
+        idx += 1;
+        Some(rows[idx])
+    } else {
+        None
+    };
+    let ptp1588_area = if ptp1588.is_some() {
         idx += 1;
         Some(rows[idx])
     } else {
@@ -136,6 +146,9 @@ fn draw(f: &mut Frame, st: &Status) {
     }
     if let (Some(area), Some(sm)) = (time_sync_area, monitor) {
         draw_time_sync(f, area, sm);
+    }
+    if let (Some(area), Some(p)) = (ptp1588_area, ptp1588) {
+        draw_ptp1588(f, area, st, p);
     }
     draw_nodes(f, nodes_area, st);
 
@@ -682,6 +695,68 @@ fn draw_counters(f: &mut Frame, area: Rect, st: &Status) {
     let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(10)])
         .block(Block::default().borders(Borders::ALL).title(" Traffic "));
     f.render_widget(table, area);
+}
+
+fn draw_ptp1588(f: &mut Frame, area: Rect, st: &Status, p: &Ptp1588Status) {
+    let lines = match &p.error {
+        Some(e) => vec![Line::from(Span::styled(
+            format!("NOT SERVED: {e}"),
+            Style::default().fg(Color::Red).bold(),
+        ))],
+        None => {
+            let (state, style) = if st.role == Role::ActiveGm {
+                ("serving", Style::default().fg(Color::Green).bold())
+            } else {
+                (
+                    "silent while we are not grandmaster",
+                    Style::default().fg(Color::Yellow),
+                )
+            };
+            let devices = if p.clients.is_empty() {
+                Span::styled(
+                    "none yet (no Delay_Req received)",
+                    Style::default().fg(Color::DarkGray),
+                )
+            } else {
+                Span::raw(
+                    p.clients
+                        .iter()
+                        .map(|c| format!("{} ({} req)", c.addr, c.requests))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            };
+            let mut devices_line = vec![Span::raw("Devices: "), devices];
+            if p.foreign_masters > 0 {
+                devices_line.push(Span::styled(
+                    format!(
+                        "   ⚠ {} other 1588 master(s) in the domain",
+                        p.foreign_masters
+                    ),
+                    Style::default().fg(Color::Red).bold(),
+                ));
+            }
+            vec![
+                Line::from(vec![
+                    Span::styled(state, style),
+                    Span::raw(format!(" — {}", p.desc)),
+                ]),
+                Line::from(format!(
+                    "Announce {}  Sync {}  Follow_Up {}  Delay_Req {} → Delay_Resp {}",
+                    p.announce_tx, p.sync_tx, p.follow_up_tx, p.delay_req_rx, p.delay_resp_tx
+                )),
+                Line::from(devices_line),
+            ]
+        }
+    };
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" PTP (IEEE 1588) beside gPTP "),
+        ),
+        area,
+    );
 }
 
 fn fmt_bps(bps: f64) -> String {

@@ -23,6 +23,10 @@ slave monitor without hardware and for injecting faults on purpose:
   timestamp, like a congested switch.
 - **monitor** — `gptp-gm --monitor` on the sensor side, headless, with
   JSONL metrics and CSV captures in the `out` volume.
+- **ptp-device** — a device that speaks only IEEE 1588 (UDP, end-to-end
+  delay): `ptp4l` as slave on the sensor side, measuring its offset to the
+  GM without adjusting the clock. The GM serves it with `--ptp udp`
+  beside gPTP, on the same interface.
 - **fwd-mask** — one-shot helper on the host: Docker's bridges drop the
   gPTP multicast `01:80:C2:00:00:0E` unless `group_fwd_mask` allows it.
   It needs `NET_ADMIN` in the host network namespace, i.e. rootful Docker.

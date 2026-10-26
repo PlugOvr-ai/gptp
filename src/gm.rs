@@ -9,11 +9,12 @@ use anyhow::Result;
 use crate::clock::{stamp_to_tai, tx_stamp_missed, TaiClock};
 use crate::config::Config;
 use crate::gmclock;
-use crate::net::RawSock;
+use crate::net::{self, RawSock};
 use crate::pdelay::PeerDelay;
 use crate::ptp::{self, AnnounceData, Msg};
+use crate::ptp1588::Port1588;
 use crate::seed::{self, Seeder};
-use crate::state::{ForeignMaster, Role, Status};
+use crate::state::{ForeignMaster, Ptp1588Status, Role, Status};
 
 pub enum Cmd {
     Quit,
@@ -36,6 +37,7 @@ pub fn run(
         clock_identity,
         port_number: 1,
         domain: cfg.domain,
+        sdo: ptp::SDO_GPTP,
     };
     let our_announce = AnnounceData {
         priority1: cfg.priority1,
@@ -110,6 +112,31 @@ pub fn run(
             ));
         }
     }
+
+    // IEEE 1588 for devices without gPTP: served while gPTP is.
+    let mut port1588 = cfg.ptp.and_then(|t| {
+        let mut st = state.lock().unwrap();
+        match Port1588::open(&cfg, t, &sock) {
+            Ok((p, desc)) => {
+                st.log(format!("PTP (IEEE 1588) beside gPTP: {desc}"));
+                st.ptp1588 = Some(Ptp1588Status {
+                    desc,
+                    ..Default::default()
+                });
+                Some(p)
+            }
+            Err(e) => {
+                st.log(format!(
+                    "WARNING: PTP (IEEE 1588) not served ({e:#}) — gPTP runs without it"
+                ));
+                st.ptp1588 = Some(Ptp1588Status {
+                    error: Some(format!("{e:#}")),
+                    ..Default::default()
+                });
+                None
+            }
+        }
+    });
 
     let mut seq_announce: u16 = 0;
     let mut seq_sync: u16 = 0;
@@ -245,6 +272,11 @@ pub fn run(
             }
         }
 
+        if let Some(p) = port1588.as_mut() {
+            p.set_active(gm_active, now);
+            p.tick(now, &clock, &sock, &state);
+        }
+
         pdelay.tick(now, &builder, &sock, &clock, &state);
         // Steered also while passive, so a takeover serves the right time.
         if let Some((logs, desc)) = discipline.as_mut().and_then(|d| d.tick(now)) {
@@ -266,10 +298,28 @@ pub fn run(
         if let (true, Some(h)) = (gm_active, handover_at) {
             deadline = deadline.min(h);
         }
+        if let Some(d) = port1588.as_ref().and_then(|p| p.next_deadline()) {
+            deadline = deadline.min(d);
+        }
         let timeout = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(100));
-        if sock.poll(timeout.as_millis() as i32)? {
+        let mut fds = vec![sock.fd()];
+        if let Some(p) = &port1588 {
+            fds.extend(p.fds());
+        }
+        let ready = net::poll_any(&fds, timeout.as_millis() as i32)?;
+        if ready[1..].contains(&true) {
+            if let Some(p) = port1588.as_mut() {
+                if let Err(e) = p.drain(&clock, &sock, &state) {
+                    state
+                        .lock()
+                        .unwrap()
+                        .log(format!("WARNING: PTP (1588) receive failed: {e:#}"));
+                }
+            }
+        }
+        if ready[0] {
             while let Some((n, stamp, _)) = sock.recv(&mut rxbuf)? {
                 let t_rx = stamp_to_tai(stamp, &sock, &clock).unwrap_or_else(|| clock.now());
                 if let Some(msg) = ptp::parse(&rxbuf[..n]) {

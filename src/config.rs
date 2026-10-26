@@ -16,6 +16,15 @@ pub enum TimeSync {
     Linuxptp,
 }
 
+/// Transport of the IEEE 1588 PTP served beside gPTP (`--ptp`).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PtpTransport {
+    /// UDP/IPv4 multicast 224.0.1.129, ports 319/320 (most devices)
+    Udp,
+    /// Ethernet, EtherType 0x88F7 to 01:1B:19:00:00:00
+    L2,
+}
+
 /// Where the grandmaster's time comes from.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GmClock {
@@ -88,6 +97,36 @@ pub struct Config {
         requires = "seed_from_gnss"
     )]
     pub seed_wait: f64,
+
+    /// Also serve IEEE 1588 PTP (default profile: two-step, end-to-end
+    /// delay) for devices that do not speak gPTP — the same time from the
+    /// same clock, beside gPTP, while we are grandmaster
+    #[arg(long, value_enum, value_name = "TRANSPORT", conflicts_with = "monitor")]
+    pub ptp: Option<PtpTransport>,
+
+    /// 1588 domainNumber (--ptp); the devices' domain
+    #[arg(long, value_name = "N", default_value_t = 0, requires = "ptp")]
+    pub ptp_domain: u8,
+
+    /// 1588 log2 Sync interval in seconds (--ptp; 0 = 1 per second)
+    #[arg(
+        long,
+        value_name = "LOG2",
+        default_value_t = 0,
+        requires = "ptp",
+        allow_negative_numbers = true
+    )]
+    pub ptp_log_sync_interval: i8,
+
+    /// 1588 log2 Announce interval in seconds (--ptp; 1 = every 2 s)
+    #[arg(
+        long,
+        value_name = "LOG2",
+        default_value_t = 1,
+        requires = "ptp",
+        allow_negative_numbers = true
+    )]
+    pub ptp_log_announce_interval: i8,
 
     /// Monitor: a deviation from the drift model beyond this is a spike
     /// (one sample) or a step (persistent). Default 1000 ns with hardware

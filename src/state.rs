@@ -162,6 +162,32 @@ pub struct Counters {
     pub tx_stamp_missed: u64,
 }
 
+/// The IEEE 1588 port served beside gPTP (`--ptp`).
+#[derive(Clone, Default)]
+pub struct Ptp1588Status {
+    /// Transport, domain, interval — or why it could not be opened.
+    pub desc: String,
+    pub error: Option<String>,
+    pub announce_tx: u64,
+    pub sync_tx: u64,
+    pub follow_up_tx: u64,
+    pub delay_req_rx: u64,
+    pub delay_resp_tx: u64,
+    /// Devices sending Delay_Req (1588 slaves), recently heard.
+    pub clients: Vec<Ptp1588Client>,
+    /// Other 1588 grandmasters seen in our domain.
+    pub foreign_masters: usize,
+}
+
+#[derive(Clone)]
+pub struct Ptp1588Client {
+    pub port: [u8; 10],
+    /// IPv4 address or MAC.
+    pub addr: String,
+    pub last_seen: Instant,
+    pub requests: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProbeMethod {
     None,
@@ -306,6 +332,8 @@ pub struct Status {
     pub tai_now_secs: u64,
     /// Present in monitor mode.
     pub sync: Option<SyncMonitor>,
+    /// IEEE 1588 PTP served beside gPTP (--ptp).
+    pub ptp1588: Option<Ptp1588Status>,
 }
 
 impl Status {
@@ -334,6 +362,7 @@ impl Status {
             events: VecDeque::new(),
             tai_now_secs: 0,
             sync: None,
+            ptp1588: None,
         }
     }
 
