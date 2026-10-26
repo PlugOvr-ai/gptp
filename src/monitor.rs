@@ -23,22 +23,27 @@
 //! changes (Announce) and gmTimeBaseIndicator changes (Follow_Up TLV).
 //! We keep answering peer delay so the bridge treats our port as asCapable
 //! and sends us Sync at all.
+//!
+//! With `--ptp udp|l2` the master watched is an IEEE 1588 one (default
+//! profile) instead: the same analysis, with the path delay measured end
+//! to end (Delay_Req/Delay_Resp) instead of by peer delay.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
+use crate::clock::tx_stamp_missed;
 use crate::clock::{stamp_to_local_ns, stamp_to_tai, TaiClock};
 use crate::clocksync::{self, Rx, SyncEngine};
-use crate::config::{Config, TimeSync};
+use crate::config::{Config, PtpTransport, TimeSync};
 use crate::gm::{log_to_duration, Cmd};
-use crate::inventory::fmt_mac;
-use crate::net::{RawSock, RawStamp};
+use crate::net::{self, RawSock, RawStamp};
 use crate::pdelay::PeerDelay;
 use crate::ptp::{self, AnnounceData, Msg, MsgBuilder, Timestamp};
+use crate::ptp1588::{Link, Sender};
 use crate::state::{ForeignMaster, Role, Status, SyncMonitor, SyncState};
 use crate::syncdiag::{self, Diag, SampleRec};
 
@@ -554,7 +559,7 @@ struct PendingSync {
     local_ns: i128,
     sys: Timestamp,
     correction_ns: i64,
-    src_mac: [u8; 6],
+    src_mac: Sender,
 }
 
 /// Recent samples split into their two parts — the GM's origin timestamp
@@ -564,13 +569,13 @@ struct StepBlame {
     hist: VecDeque<Part>,
 }
 
-/// (local ns, origin − local ns, correction ns, sender MAC)
-type Part = (i128, i128, i128, [u8; 6]);
+/// (local ns, origin − local ns, correction ns, sender)
+type Part = (i128, i128, i128, Sender);
 
 impl StepBlame {
     const KEEP: usize = 16;
 
-    fn push(&mut self, local_ns: i128, origin_ns: i128, correction_ns: i64, mac: [u8; 6]) {
+    fn push(&mut self, local_ns: i128, origin_ns: i128, correction_ns: i64, mac: Sender) {
         self.hist
             .push_back((local_ns, origin_ns - local_ns, correction_ns as i128, mac));
         if self.hist.len() > Self::KEEP {
@@ -588,7 +593,7 @@ impl StepBlame {
         let Some(&(x, o, c, mac)) = self.hist.back() else {
             return String::new();
         };
-        let mut s = format!(" — sender {}", fmt_mac(&mac));
+        let mut s = format!(" — sender {mac}");
         if n > STEP_SAMPLES {
             let pre: Vec<_> = self.hist.iter().take(n - STEP_SAMPLES).collect();
             let (first, last) = (pre[0], pre[pre.len() - 1]);
@@ -617,12 +622,149 @@ impl StepBlame {
                 );
             }
             if last.3 != mac {
-                s += &format!(" (sender changed from {})", fmt_mac(&last.3));
+                s += &format!(" (sender changed from {})", last.3);
             }
         }
         let drop = n.saturating_sub(STEP_SAMPLES);
         self.hist.drain(..drop);
         s
+    }
+}
+
+/// 1588 end-to-end path delay (--ptp): a Delay_Req right after a measured
+/// Sync, so the master−local offset is the same in both directions and
+/// cancels, at most as often as the master allows (logMinDelayReqInterval
+/// in its Delay_Resp). The median of the last few measurements is used.
+struct E2eDelay {
+    seq: u16,
+    interval: Duration,
+    last_sent: Option<Instant>,
+    /// (seq, Delay_Req send time t3, master→slave delay of the Sync
+    /// just before it), ns
+    pending: Option<(u16, i128, i128)>,
+    recent: VecDeque<f64>,
+    delay_ns: Option<f64>,
+    answered: u64,
+    unanswered: u64,
+}
+
+impl E2eDelay {
+    const KEEP: usize = 8;
+    /// Unanswered Delay_Reqs before warning that the master does not answer.
+    const WARN_AFTER: u64 = 5;
+
+    fn new() -> Self {
+        E2eDelay {
+            seq: 0,
+            interval: Duration::from_secs(1),
+            last_sent: None,
+            pending: None,
+            recent: VecDeque::new(),
+            delay_ns: None,
+            answered: 0,
+            unanswered: 0,
+        }
+    }
+
+    /// A new master: measure afresh.
+    fn reset(&mut self) {
+        self.pending = None;
+        self.recent.clear();
+        self.delay_ns = None;
+        self.answered = 0;
+        self.unanswered = 0;
+    }
+
+    /// After a measured Sync with master→slave delay `ms_ns`: send a
+    /// Delay_Req when due.
+    fn after_sync(
+        &mut self,
+        ms_ns: i128,
+        link: &Link,
+        builder: &MsgBuilder,
+        sock: &RawSock,
+        clock: &TaiClock,
+        state: &Arc<Mutex<Status>>,
+    ) {
+        let now = Instant::now();
+        if self
+            .last_sent
+            .is_some_and(|t| now.duration_since(t) < self.interval)
+        {
+            return;
+        }
+        self.last_sent = Some(now);
+        if self.pending.take().is_some() {
+            self.unanswered += 1;
+            if self.unanswered == Self::WARN_AFTER && self.answered == 0 {
+                state.lock().unwrap().log(
+                    "WARNING: the master answers no Delay_Req — path delay not measured, \
+                     the offset to the system clock excludes it",
+                );
+            }
+        }
+        let seq = self.seq;
+        self.seq = self.seq.wrapping_add(1);
+        let Ok(raw) = link.send_event_stamped(&builder.delay_req(seq)) else {
+            return;
+        };
+        // No guesses: a request without its transmit stamp is not used.
+        if tx_stamp_missed(sock, &raw) {
+            state.lock().unwrap().counters.tx_stamp_missed += 1;
+            return;
+        }
+        if let Some(t3) = raw.and_then(|r| stamp_to_tai(Some(r), sock, clock)) {
+            self.pending = Some((seq, t3.to_ns(), ms_ns));
+        }
+    }
+
+    /// A Delay_Resp to us from the followed master; a log line for the
+    /// first measurement.
+    fn handle(
+        &mut self,
+        seq: u16,
+        log_interval: i8,
+        receive: Timestamp,
+        correction_ns: i64,
+    ) -> Option<String> {
+        let (s, t3, ms) = self.pending?;
+        if s != seq {
+            return None;
+        }
+        self.pending = None;
+        self.unanswered = 0;
+        let sm = receive.to_ns() - correction_ns as i128 - t3;
+        let d = (ms + sm) as f64 / 2.0;
+        self.recent.push_back(d);
+        if self.recent.len() > Self::KEEP {
+            self.recent.pop_front();
+        }
+        self.delay_ns = median(&mut self.recent.iter().copied().collect::<Vec<_>>());
+        self.interval = log_to_duration(log_interval.clamp(-4, 6));
+        self.answered += 1;
+        (self.answered == 1).then(|| {
+            format!(
+                "Path delay to the master (E2E): {}",
+                fmt_ns(d).trim_start_matches('+')
+            )
+        })
+    }
+}
+
+/// The path delay added to the master's time: peer delay for gPTP, E2E
+/// for 1588; none measured in listen-only mode.
+fn path_delay(
+    link: &Option<Link>,
+    e2e: &E2eDelay,
+    pdelay: &PeerDelay,
+    listen_only: bool,
+) -> Option<f64> {
+    if listen_only {
+        None
+    } else if link.is_some() {
+        e2e.delay_ns
+    } else {
+        pdelay.link_delay_ns
     }
 }
 
@@ -634,29 +776,62 @@ pub fn run(
     cmds: Receiver<Cmd>,
 ) -> Result<()> {
     let clock_identity = ptp::clock_identity_from_mac(sock.mac);
+    // --ptp: watch an IEEE 1588 master instead of gPTP.
+    let (link, protocol) = match cfg.ptp {
+        Some(t) => {
+            let (l, desc) = Link::open(&cfg, t, &sock).context("opening the 1588 sockets")?;
+            (
+                Some(l),
+                format!(
+                    "PTP (IEEE 1588) over {desc}, domain {}, E2E",
+                    cfg.ptp_domain
+                ),
+            )
+        }
+        None => (None, format!("gPTP, domain {}", cfg.domain)),
+    };
+    let domain = if link.is_some() {
+        cfg.ptp_domain
+    } else {
+        cfg.domain
+    };
     let builder = MsgBuilder {
         clock_identity,
         port_number: 1,
-        domain: cfg.domain,
-        sdo: ptp::SDO_GPTP,
+        domain,
+        sdo: if link.is_some() {
+            ptp::SDO_1588
+        } else {
+            ptp::SDO_GPTP
+        },
     };
-    let hw = sock.is_hardware_ts();
+    let mut our_port = [0u8; 10];
+    our_port[..8].copy_from_slice(&clock_identity);
+    our_port[8..].copy_from_slice(&builder.port_number.to_be_bytes());
+    let hw = match cfg.ptp {
+        Some(PtpTransport::Udp) => sock.is_udp_hardware_ts(),
+        _ => sock.is_hardware_ts(),
+    };
     let th = Thresholds::new(&cfg, hw);
     let start = Instant::now();
 
     {
         let mut st = state.lock().unwrap();
         st.role = Role::Monitor;
-        st.sync = Some(SyncMonitor::default());
+        st.sync = Some(SyncMonitor {
+            protocol: protocol.clone(),
+            e2e: link.is_some(),
+            ..Default::default()
+        });
         st.clock_identity = clock_identity;
-        st.domain = cfg.domain;
+        st.domain = domain;
         st.time_source_desc = clock.describe().to_string();
         st.ts_desc = sock.ts_desc().to_string();
         st.ts_hardware = hw;
         st.utc_offset = clock.utc_offset();
         st.started = start;
         st.log(format!(
-            "Started as slave monitor on {} (clock {}) — jump threshold {}, \
+            "Started as slave monitor of {protocol} on {} (clock {}) — jump threshold {}, \
              frequency threshold {:.0} ppb{}",
             cfg.iface(),
             ptp::fmt_clock_identity(&clock_identity),
@@ -681,8 +856,13 @@ pub fn run(
 
     // Another gPTP stack on this port (ptp4l) answers peer delay already: a
     // second responder makes the bridge treat the link as not asCapable and
-    // stop sending Sync, and makes ptp4l report rogue responses.
-    let ptp4l = clocksync::running(&["ptp4l"]);
+    // stop sending Sync, and makes ptp4l report rogue responses. Our 1588
+    // Delay_Req disturbs nobody.
+    let ptp4l = if link.is_none() {
+        clocksync::running(&["ptp4l"])
+    } else {
+        Vec::new()
+    };
     let listen_only =
         cfg.listen_only || cfg.time_sync == Some(TimeSync::Linuxptp) || !ptp4l.is_empty();
     {
@@ -696,8 +876,14 @@ pub fn run(
                 "--listen-only".to_string()
             };
             st.log(format!(
-                "Listen-only: sending nothing, no peer delay ({why}); the offset to the system \
-                 clock excludes the link delay"
+                "Listen-only: sending nothing, no {} ({why}); the offset to the system \
+                 clock excludes the {} delay",
+                if link.is_some() {
+                    "Delay_Req"
+                } else {
+                    "peer delay"
+                },
+                if link.is_some() { "path" } else { "link" }
             ));
         }
         st.sync.as_mut().unwrap().listen_only = listen_only;
@@ -732,6 +918,7 @@ pub fn run(
     let mut utc_logged: Option<(i32, bool)> = None;
 
     let mut pdelay = PeerDelay::new(start);
+    let mut e2e = E2eDelay::new();
     let mut analyzer = Analyzer::new(th);
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut selected: Option<[u8; 10]> = None;
@@ -758,7 +945,7 @@ pub fn run(
         }
 
         let now = Instant::now();
-        if !listen_only {
+        if !listen_only && link.is_none() {
             pdelay.tick(now, &builder, &sock, &clock, &state);
         }
 
@@ -889,6 +1076,7 @@ pub fn run(
                 }
             }
             selected = best.map(|b| b.0);
+            e2e.reset();
             diag.on_master_change();
             pending = None;
             last_seq = None;
@@ -916,13 +1104,37 @@ pub fn run(
         let timeout = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(50));
-        if sock.poll(timeout.as_millis() as i32)? {
-            while let Some((n, stamp, src_mac)) = sock.recv(&mut rxbuf)? {
+        let fds = match &link {
+            Some(l) => l.fds(),
+            None => vec![sock.fd()],
+        };
+        let ready = net::poll_any(&fds, timeout.as_millis() as i32)?;
+        for (i, _) in ready.iter().enumerate().filter(|(_, r)| **r) {
+            loop {
+                let got = match &link {
+                    Some(l) => l
+                        .recv(i, &mut rxbuf)?
+                        .map(|(n, s, from)| (n, s, from.sender)),
+                    None => sock
+                        .recv(&mut rxbuf)?
+                        .map(|(n, s, mac)| (n, s, Sender::Mac(mac))),
+                };
+                let Some((n, stamp, src_mac)) = got else {
+                    break;
+                };
+                if link.is_some()
+                    && (ptp::sdo(&rxbuf[..n]) != Some(ptp::SDO_1588) || rxbuf[4] != domain)
+                {
+                    continue;
+                }
                 let t_rx = stamp_to_tai(stamp, &sock, &clock).unwrap_or_else(|| clock.now());
                 let Some(msg) = ptp::parse(&rxbuf[..n]) else {
                     continue;
                 };
-                if !listen_only && pdelay.handle(&msg, t_rx, &builder, &sock, &clock, &state) {
+                if !listen_only
+                    && link.is_none()
+                    && pdelay.handle(&msg, t_rx, &builder, &sock, &clock, &state)
+                {
                     continue;
                 }
                 match msg {
@@ -1035,6 +1247,7 @@ pub fn run(
                         if two_step {
                             pending = Some(p);
                         } else {
+                            let ms_ns = p.sys.to_ns() - origin.to_ns() - correction_ns as i128;
                             sample(
                                 p,
                                 origin,
@@ -1042,7 +1255,7 @@ pub fn run(
                                 None,
                                 None,
                                 Ctx {
-                                    link_delay_ns: pdelay.link_delay_ns.filter(|_| !listen_only),
+                                    link_delay_ns: path_delay(&link, &e2e, &pdelay, listen_only),
                                     analyzer: &mut analyzer,
                                     diag: &mut diag,
                                     engine: engine.as_mut(),
@@ -1054,6 +1267,9 @@ pub fn run(
                                     fup_mac: src_mac,
                                 },
                             );
+                            if let (Some(l), false) = (&link, listen_only) {
+                                e2e.after_sync(ms_ns, l, &builder, &sock, &clock, &state);
+                            }
                         }
                     }
                     Msg::FollowUp {
@@ -1087,6 +1303,10 @@ pub fn run(
                         if pending.as_ref().is_some_and(|p| p.seq == seq) {
                             let p = pending.take().unwrap();
                             let fup_delay_us = p.rx_at.elapsed().as_secs_f64() * 1e6;
+                            // Master→slave delay of this Sync, for E2E.
+                            let ms_ns = p.sys.to_ns()
+                                - precise_origin.to_ns()
+                                - (p.correction_ns + correction_ns) as i128;
                             // cumulativeScaledRateOffset = (rateRatio - 1) * 2^41
                             let rate_ppb = info.map(|i| {
                                 i.cumulative_scaled_rate_offset as f64 / 2f64.powi(41) * 1e9
@@ -1098,7 +1318,7 @@ pub fn run(
                                 Some(fup_delay_us),
                                 rate_ppb,
                                 Ctx {
-                                    link_delay_ns: pdelay.link_delay_ns.filter(|_| !listen_only),
+                                    link_delay_ns: path_delay(&link, &e2e, &pdelay, listen_only),
                                     analyzer: &mut analyzer,
                                     diag: &mut diag,
                                     engine: engine.as_mut(),
@@ -1110,6 +1330,21 @@ pub fn run(
                                     fup_mac: src_mac,
                                 },
                             );
+                            if let (Some(l), false) = (&link, listen_only) {
+                                e2e.after_sync(ms_ns, l, &builder, &sock, &clock, &state);
+                            }
+                        }
+                    }
+                    Msg::DelayResp {
+                        source,
+                        seq,
+                        log_interval,
+                        receive,
+                        requesting,
+                        correction_ns,
+                    } if link.is_some() && Some(source) == selected && requesting == our_port => {
+                        if let Some(l) = e2e.handle(seq, log_interval, receive, correction_ns) {
+                            state.lock().unwrap().log(l);
                         }
                     }
                     _ => {}
@@ -1125,7 +1360,7 @@ pub fn run(
             st.log(l);
         }
         st.tai_now_secs = clock.now().secs;
-        st.link_delay_ns = pdelay.link_delay_ns.filter(|_| !listen_only);
+        st.link_delay_ns = path_delay(&link, &e2e, &pdelay, listen_only);
         st.foreign_masters = candidates
             .iter()
             .map(|c| ForeignMaster {
@@ -1177,7 +1412,7 @@ struct Ctx<'a> {
     state: &'a Arc<Mutex<Status>>,
     blame: &'a mut StepBlame,
     /// Sender of the Follow_Up (of the Sync for one-step).
-    fup_mac: [u8; 6],
+    fup_mac: Sender,
 }
 
 /// Process one complete Sync (+ Follow_Up) measurement.
@@ -1269,7 +1504,7 @@ fn sample(
                     diag.trigger("time step");
                     let mut why = blame.explain(size_ns);
                     if p.src_mac != fup_mac {
-                        why += &format!(" (Sync from {})", fmt_mac(&p.src_mac));
+                        why += &format!(" (Sync from {})", p.src_mac);
                     }
                     logs.push(format!(
                         "ALARM: master time STEP {} (GM {gm}){why}{}",
@@ -1436,6 +1671,25 @@ fn fmt_port(p: &[u8; 10]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e2e_path_delay() {
+        // Path delay 200 ns, our clock 100 ns ahead of the master: the
+        // Sync shows 300 ns master→slave, the Delay_Req 100 ns back.
+        let mut e = E2eDelay::new();
+        e.pending = Some((5, 1_000, 300));
+        let t4 = Timestamp::from_ns(1_000 - 100 + 200);
+        assert!(e.handle(4, 0, t4, 0).is_none(), "other sequence ignored");
+        let first = e.handle(5, 1, t4, 0).expect("first measurement logged");
+        assert!(first.contains("200 ns"), "{first}");
+        assert_eq!(e.delay_ns, Some(200.0));
+        assert_eq!(e.interval, Duration::from_secs(2));
+        // A transparent clock's correction is taken off the reverse path.
+        e.pending = Some((6, 1_000, 300));
+        e.handle(6, 1, Timestamp::from_ns(1_100 + 40), 40);
+        assert_eq!(e.delay_ns, Some(200.0));
+        assert!(e.handle(6, 1, t4, 0).is_none(), "answered once");
+    }
 
     const TH: Thresholds = Thresholds {
         jump_ns: 1_000.0,
@@ -1708,7 +1962,7 @@ mod tests {
                 local,
                 origin,
                 corr as i64,
-                if i >= 7 { other } else { bridge },
+                Sender::Mac(if i >= 7 { other } else { bridge }),
             );
         }
         b.explain((origin_step + corr_step) as f64)

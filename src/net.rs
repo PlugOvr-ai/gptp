@@ -92,6 +92,8 @@ pub struct RawSock {
     mcast: [u8; 6],
     ts_mode: TsMode,
     ts_desc: String,
+    /// The NIC also stamps PTP over UDP in hardware.
+    udp_hw: bool,
 }
 
 /// (PTP payload length, receive timestamp, sender MAC)
@@ -184,7 +186,7 @@ impl RawSock {
         }
 
         let gen_fd = open_general(ifindex).map_err(close_on_err)?;
-        let (ts_mode, ts_desc) = init_timestamping(fd, ifname, force_software, need_l4);
+        let (ts_mode, ts_desc, udp_hw) = init_timestamping(fd, ifname, force_software, need_l4);
         Ok(RawSock {
             fd,
             gen_fd,
@@ -192,11 +194,17 @@ impl RawSock {
             mcast,
             ts_mode,
             ts_desc,
+            udp_hw,
         })
     }
 
     pub fn is_hardware_ts(&self) -> bool {
         matches!(self.ts_mode, TsMode::Hardware(_))
+    }
+
+    /// Hardware stamps for PTP over UDP too (opened with `need_l4`).
+    pub fn is_udp_hardware_ts(&self) -> bool {
+        self.udp_hw
     }
 
     pub fn phc(&self) -> Option<&PhcClock> {
@@ -347,11 +355,6 @@ impl RawSock {
         }
         Ok(Some((rc as usize, addr.sll_pkttype, stamp)))
     }
-
-    /// Wait until the socket is readable or the timeout elapses.
-    pub fn poll(&self, timeout_ms: i32) -> Result<bool> {
-        Ok(poll_any(&[self.fd], timeout_ms)?[0])
-    }
 }
 
 /// The packet timestamp in an SCM_TIMESTAMPING control message, if `cmsg`
@@ -469,14 +472,18 @@ fn init_timestamping(
     ifname: &str,
     force_software: bool,
     need_l4: bool,
-) -> (TsMode, String) {
+) -> (TsMode, String, bool) {
     let hw_err = if force_software {
         "disabled by --force-sw-timestamps".to_string()
     } else {
         match try_enable_hardware(fd, ifname, need_l4) {
             Ok(phc) => {
                 let device = phc.device.clone();
-                return (TsMode::Hardware(phc), format!("hardware ({device})"));
+                return (
+                    TsMode::Hardware(phc),
+                    format!("hardware ({device})"),
+                    need_l4,
+                );
             }
             // A NIC that stamps only Ethernet PTP: gPTP keeps hardware
             // stamps, PTP over UDP gets software receive stamps.
@@ -486,6 +493,7 @@ fn init_timestamping(
                     return (
                         TsMode::Hardware(phc),
                         format!("hardware ({device}; Ethernet PTP only, not UDP)"),
+                        false,
                     );
                 }
                 Err(e) => format!("{e:#}"),
@@ -496,9 +504,13 @@ fn init_timestamping(
 
     // Fall back to kernel software timestamps.
     if set_so_timestamping(fd, TS_SOFTWARE_FLAGS).is_ok() {
-        (TsMode::Software, format!("software — {hw_err}"))
+        (TsMode::Software, format!("software — {hw_err}"), false)
     } else {
-        (TsMode::None, format!("clock sampling only — {hw_err}"))
+        (
+            TsMode::None,
+            format!("clock sampling only — {hw_err}"),
+            false,
+        )
     }
 }
 

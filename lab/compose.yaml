@@ -100,6 +100,27 @@ services:
     command: >
       ptp4l -i eth0 -4 -E -S -s -m --free_running 1 --summary_interval 2
 
+  # The slave monitor watching the GM's IEEE 1588 (UDP, end-to-end delay)
+  # instead of gPTP.
+  monitor-1588:
+    <<: *node
+    networks: [sensor_side]
+    command: gptp-gm eth0 --monitor --no-tui --no-inventory --ptp udp
+
+  # A foreign 1588 master: ptp4l over Ethernet in domain 5, watched from the
+  # sensor side by monitor-l2.
+  ptp-master:
+    <<: *node
+    networks: [gm_side]
+    command: >
+      ptp4l -i eth0 -2 -E -S -m --domainNumber 5 --priority1 10
+      --free_running 1 --summary_interval 2
+  monitor-l2:
+    <<: *node
+    networks: [sensor_side]
+    command: >
+      gptp-gm eth0 --monitor --no-tui --no-inventory --ptp l2 --ptp-domain 5
+
   # Interactive monitor TUI:
   #   docker compose -f lab/compose.yaml run --rm monitor-tui
   monitor-tui:

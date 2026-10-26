@@ -52,6 +52,10 @@ impl SyncState {
 /// steps, spikes, wander — as the residual of a linear fit.
 #[derive(Clone)]
 pub struct SyncMonitor {
+    /// What is monitored: gPTP, or IEEE 1588 (--ptp) and its transport.
+    pub protocol: String,
+    /// 1588: the path delay is measured end to end, not by peer delay.
+    pub e2e: bool,
     pub state: SyncState,
     pub master_port: Option<[u8; 10]>,
     pub gm: Option<AnnounceData>,
@@ -109,6 +113,8 @@ pub struct SyncMonitor {
 impl Default for SyncMonitor {
     fn default() -> Self {
         SyncMonitor {
+            protocol: String::new(),
+            e2e: false,
             state: SyncState::NoMaster,
             master_port: None,
             gm: None,

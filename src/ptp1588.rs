@@ -52,33 +52,37 @@ enum Transport {
     Udp { event: Udp, general: Udp },
 }
 
+/// Who sent a received message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sender {
+    Mac([u8; 6]),
+    Ip(Ipv4Addr),
+}
+
+impl std::fmt::Display for Sender {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Sender::Mac(m) => f.write_str(&fmt_mac(m)),
+            Sender::Ip(a) => write!(f, "{a}"),
+        }
+    }
+}
+
 /// Where a received message came from, for the answer and the client list.
-struct From {
+pub struct From {
     /// UDP: the sender, if it wrote to us unicast (answered unicast).
-    unicast: Option<Ipv4Addr>,
-    desc: String,
+    pub unicast: Option<Ipv4Addr>,
+    pub sender: Sender,
 }
 
-pub struct Port1588 {
+/// The 1588 sockets on the gPTP socket's interface, shared by the
+/// grandmaster (`Port1588`) and the monitor.
+pub struct Link {
     transport: Transport,
-    builder: MsgBuilder,
-    announce: AnnounceData,
-    log_sync: i8,
-    log_announce: i8,
-    sync_interval: Duration,
-    announce_interval: Duration,
-    seq_sync: u16,
-    seq_announce: u16,
-    next_sync: Instant,
-    next_announce: Instant,
-    active: bool,
-    /// Foreign 1588 grandmasters already reported.
-    foreign: Vec<[u8; 8]>,
 }
 
-impl Port1588 {
-    /// Open the 1588 port on the gPTP socket's interface. Returns the port
-    /// and its description for the UI.
+impl Link {
+    /// Returns the link and its description for the UI.
     pub fn open(cfg: &Config, transport: PtpTransport, gptp: &RawSock) -> Result<(Self, String)> {
         let (transport, desc) = match transport {
             PtpTransport::L2 => {
@@ -119,13 +123,101 @@ impl Port1588 {
                 )
             }
         };
+        Ok((Link { transport }, desc))
+    }
+
+    pub fn fds(&self) -> Vec<RawFd> {
+        match &self.transport {
+            Transport::L2(s) => vec![s.fd()],
+            Transport::Udp { event, general } => vec![event.0, general.0],
+        }
+    }
+
+    /// Send a general message to the multicast group, or unicast.
+    pub fn send_general(&self, payload: &[u8], unicast: Option<Ipv4Addr>) -> Result<()> {
+        match &self.transport {
+            Transport::L2(s) => s.send(payload),
+            Transport::Udp { general, .. } => sendto(
+                general.0,
+                payload,
+                unicast.unwrap_or(PTP_PRIMARY),
+                GENERAL_PORT,
+            )
+            .context("sending PTP general message"),
+        }
+    }
+
+    /// Send an event message to the multicast group; its transmit stamp.
+    pub fn send_event_stamped(&self, payload: &[u8]) -> Result<Option<RawStamp>> {
+        match &self.transport {
+            Transport::L2(s) => s.send_stamped(payload),
+            Transport::Udp { event, .. } => udp_send_stamped(event.0, payload),
+        }
+    }
+
+    /// Receive one message from socket `i` of `fds()`.
+    pub fn recv(
+        &self,
+        i: usize,
+        buf: &mut [u8],
+    ) -> Result<Option<(usize, Option<RawStamp>, From)>> {
+        match &self.transport {
+            Transport::L2(s) => Ok(s.recv(buf)?.map(|(n, stamp, mac)| {
+                (
+                    n,
+                    stamp,
+                    From {
+                        unicast: None,
+                        sender: Sender::Mac(mac),
+                    },
+                )
+            })),
+            Transport::Udp { event, general } => {
+                let fd = if i == 0 { event.0 } else { general.0 };
+                Ok(udp_recv(fd, buf, 0)?.map(|(n, stamp, src, dst)| {
+                    (
+                        n,
+                        stamp,
+                        From {
+                            unicast: (!dst.is_some_and(|d| d.is_multicast())).then_some(src),
+                            sender: Sender::Ip(src),
+                        },
+                    )
+                }))
+            }
+        }
+    }
+}
+
+pub struct Port1588 {
+    link: Link,
+    builder: MsgBuilder,
+    announce: AnnounceData,
+    log_sync: i8,
+    log_announce: i8,
+    sync_interval: Duration,
+    announce_interval: Duration,
+    seq_sync: u16,
+    seq_announce: u16,
+    next_sync: Instant,
+    next_announce: Instant,
+    active: bool,
+    /// Foreign 1588 grandmasters already reported.
+    foreign: Vec<[u8; 8]>,
+}
+
+impl Port1588 {
+    /// Open the 1588 port on the gPTP socket's interface. Returns the port
+    /// and its description for the UI.
+    pub fn open(cfg: &Config, transport: PtpTransport, gptp: &RawSock) -> Result<(Self, String)> {
+        let (link, desc) = Link::open(cfg, transport, gptp)?;
         let identity = ptp::clock_identity_from_mac(gptp.mac);
         let now = Instant::now();
         let log_sync = cfg.ptp_log_sync_interval;
         let log_announce = cfg.ptp_log_announce_interval;
         Ok((
             Port1588 {
-                transport,
+                link,
                 builder: MsgBuilder {
                     clock_identity: identity,
                     port_number: PORT_NUMBER,
@@ -171,10 +263,7 @@ impl Port1588 {
     }
 
     pub fn fds(&self) -> Vec<RawFd> {
-        match &self.transport {
-            Transport::L2(s) => vec![s.fd()],
-            Transport::Udp { event, general } => vec![event.0, general.0],
-        }
+        self.link.fds()
     }
 
     /// The next send, while active.
@@ -207,7 +296,7 @@ impl Port1588 {
                 a.time_source,
             );
             self.seq_announce = self.seq_announce.wrapping_add(1);
-            if self.send_general(&msg, None).is_ok() {
+            if self.link.send_general(&msg, None).is_ok() {
                 with_status(state, |p| p.announce_tx += 1);
             }
             self.next_announce = catch_up(self.next_announce, self.announce_interval, now);
@@ -218,7 +307,7 @@ impl Port1588 {
             let sync = self.builder.sync(seq, self.log_sync);
             let fallback = clock.now();
             // As for gPTP: without a hardware stamp no Follow_Up (no guesses).
-            let origin = match self.send_event_stamped(&sync) {
+            let origin = match self.link.send_event_stamped(&sync) {
                 Ok(raw) if tx_stamp_missed(gptp, &raw) => {
                     state.lock().unwrap().counters.tx_stamp_missed += 1;
                     with_status(state, |p| p.sync_tx += 1);
@@ -232,7 +321,7 @@ impl Port1588 {
             };
             if let Some(o) = origin {
                 let fup = self.builder.follow_up_1588(seq, o, self.log_sync);
-                if self.send_general(&fup, None).is_ok() {
+                if self.link.send_general(&fup, None).is_ok() {
                     with_status(state, |p| p.follow_up_tx += 1);
                 }
             }
@@ -249,7 +338,7 @@ impl Port1588 {
     ) -> Result<()> {
         let mut buf = [0u8; 1600];
         for i in 0..self.fds().len() {
-            while let Some((n, stamp, from)) = self.recv(i, &mut buf)? {
+            while let Some((n, stamp, from)) = self.link.recv(i, &mut buf)? {
                 let payload = &buf[..n];
                 if ptp::sdo(payload) != Some(ptp::SDO_1588)
                     || payload.get(4) != Some(&self.builder.domain)
@@ -275,7 +364,7 @@ impl Port1588 {
                              (prio1 {}, class {}) — {}",
                             ptp::fmt_clock_identity(&data.gm_identity),
                             self.builder.domain,
-                            from.desc,
+                            from.sender,
                             data.priority1,
                             data.clock_class,
                             if ours_better {
@@ -314,11 +403,11 @@ impl Port1588 {
                 Some(c) => {
                     c.last_seen = Instant::now();
                     c.requests += 1;
-                    c.addr = from.desc.clone();
+                    c.addr = from.sender.to_string();
                 }
                 None => p.clients.push(Ptp1588Client {
                     port: source,
-                    addr: from.desc.clone(),
+                    addr: from.sender.to_string(),
                     last_seen: Instant::now(),
                     requests: 1,
                 }),
@@ -330,57 +419,8 @@ impl Port1588 {
         let resp = self
             .builder
             .delay_resp(seq, &source, t4, correction_ns, LOG_MIN_DELAY_REQ);
-        if self.send_general(&resp, from.unicast).is_ok() {
+        if self.link.send_general(&resp, from.unicast).is_ok() {
             with_status(state, |p| p.delay_resp_tx += 1);
-        }
-    }
-
-    fn send_general(&self, payload: &[u8], unicast: Option<Ipv4Addr>) -> Result<()> {
-        match &self.transport {
-            Transport::L2(s) => s.send(payload),
-            Transport::Udp { general, .. } => sendto(
-                general.0,
-                payload,
-                unicast.unwrap_or(PTP_PRIMARY),
-                GENERAL_PORT,
-            )
-            .context("sending PTP general message"),
-        }
-    }
-
-    fn send_event_stamped(&self, payload: &[u8]) -> Result<Option<RawStamp>> {
-        match &self.transport {
-            Transport::L2(s) => s.send_stamped(payload),
-            Transport::Udp { event, .. } => udp_send_stamped(event.0, payload),
-        }
-    }
-
-    /// Receive one message from socket `i` of `fds()`.
-    fn recv(&self, i: usize, buf: &mut [u8]) -> Result<Option<(usize, Option<RawStamp>, From)>> {
-        match &self.transport {
-            Transport::L2(s) => Ok(s.recv(buf)?.map(|(n, stamp, mac)| {
-                (
-                    n,
-                    stamp,
-                    From {
-                        unicast: None,
-                        desc: fmt_mac(&mac),
-                    },
-                )
-            })),
-            Transport::Udp { event, general } => {
-                let fd = if i == 0 { event.0 } else { general.0 };
-                Ok(udp_recv(fd, buf, 0)?.map(|(n, stamp, src, dst)| {
-                    (
-                        n,
-                        stamp,
-                        From {
-                            unicast: (!dst.is_some_and(|d| d.is_multicast())).then_some(src),
-                            desc: src.to_string(),
-                        },
-                    )
-                }))
-            }
         }
     }
 }

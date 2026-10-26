@@ -330,7 +330,7 @@ Selected options (see `--help` for all):
 | `--utc-offset <s>` | 37 | UTC→TAI offset when the kernel TAI offset is unset |
 | `--gm-clock <src>` | auto | time source: `phc-disciplined` with hardware timestamps, else `system`; or `phc` (free-running NIC clock) |
 | `--seed-from-gnss` | off | before announcing, take time and frequency from a GNSS-locked master on the network (clockClass 6/7), then take over; `--seed-wait <s>` (60) |
-| `--ptp <udp\|l2>` | off | also serve IEEE 1588 PTP (default profile, E2E) beside gPTP on the same interface; `--ptp-domain` (0), `--ptp-log-sync-interval` (0) |
+| `--ptp <udp\|l2>` | off | GM: also serve IEEE 1588 PTP (default profile, E2E) beside gPTP on the same interface; monitor: watch a 1588 master instead of gPTP; `--ptp-domain` (0), `--ptp-log-sync-interval` (0) |
 | `--force-sw-timestamps` | off | skip NIC hardware timestamping even if available |
 | `--scan-subnet <CIDR>` | off | ARP-sweep this subnet (/22../30) to find silent nodes |
 | `--no-inventory` | off | disable node discovery and latency probing |
@@ -421,6 +421,15 @@ restart the service, so a reinstall picks up new code and arguments.
   1588 master in the domain is reported. UDP ports below 1024 need root or
   `CAP_NET_BIND_SERVICE` (the installer adds it); a ptp4l already serving
   UDP PTP on the machine blocks them.
+
+  **Monitoring a 1588 master** (`--monitor --ptp udp|l2`, `--ptp-domain`):
+  the monitor follows the best 1588 master instead of gPTP, with the same
+  analysis and alarms. The path delay is measured end to end: a Delay_Req
+  right after a measured Sync, at the rate the master allows; the median
+  of the last 8 is used. A master that answers none is reported, and
+  `--listen-only` sends nothing. One monitor watches one protocol: to
+  watch gPTP and 1588 at once, run two (the installer's service is one of
+  them, the other e.g. headless with `--no-tui`).
 - **When only software timestamping is available** (e.g. Raspberry Pi 4's
   NIC has no PHC), the program says so clearly: a red **⚠ SW TIMESTAMPS
   ONLY** badge in the TUI title bar and Clock panel, `ts=SW-ONLY(!)` in

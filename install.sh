@@ -425,6 +425,7 @@ fi
 # --- Service ---------------------------------------------------------------------------------
 if [ "$MONITOR" -eq 1 ]; then
     SERVICE=gptp-monitor OTHER=gptp-gm OTHER_ARG=gm DESCRIPTION="gPTP slave monitor on $IFACE"
+    [ -z "$PTP" ] || DESCRIPTION="PTP (IEEE 1588) slave monitor on $IFACE"
 else
     SERVICE=gptp-gm OTHER=gptp-monitor OTHER_ARG=monitor DESCRIPTION="gPTP grandmaster on $IFACE"
 fi

@@ -442,10 +442,15 @@ fn draw_sync_monitor(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonitor) {
         ),
         keyed("Timestamping", ts_value),
         info_line(
-            "Peer link delay",
+            if sm.e2e {
+                "Path delay (E2E)"
+            } else {
+                "Peer link delay"
+            },
             match st.link_delay_ns {
                 Some(d) => format!("{d:.0} ns"),
                 None if sm.listen_only => "not measured (listen-only)".into(),
+                None if sm.e2e => "no Delay_Resp yet".into(),
                 None => "no pdelay peer yet".into(),
             },
         ),
@@ -458,7 +463,7 @@ fn draw_sync_monitor(f: &mut Frame, area: Rect, st: &Status, sm: &SyncMonitor) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Sync monitor "),
+                .title(format!(" Sync monitor — {} ", sm.protocol)),
         ),
         area,
     );

@@ -98,13 +98,14 @@ pub struct Config {
     )]
     pub seed_wait: f64,
 
-    /// Also serve IEEE 1588 PTP (default profile: two-step, end-to-end
-    /// delay) for devices that do not speak gPTP — the same time from the
-    /// same clock, beside gPTP, while we are grandmaster
-    #[arg(long, value_enum, value_name = "TRANSPORT", conflicts_with = "monitor")]
+    /// IEEE 1588 PTP (default profile: two-step, end-to-end delay), for
+    /// devices that do not speak gPTP. Grandmaster: also serve it, the same
+    /// time from the same clock, beside gPTP while we are grandmaster.
+    /// Monitor: watch a 1588 master instead of gPTP
+    #[arg(long, value_enum, value_name = "TRANSPORT")]
     pub ptp: Option<PtpTransport>,
 
-    /// 1588 domainNumber (--ptp); the devices' domain
+    /// 1588 domainNumber (--ptp); the devices' or the master's domain
     #[arg(long, value_name = "N", default_value_t = 0, requires = "ptp")]
     pub ptp_domain: u8,
 

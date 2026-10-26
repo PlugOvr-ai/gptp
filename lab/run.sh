@@ -9,7 +9,8 @@
 #      toward the sensors (skipped if the host kernel lacks netem)
 #   2. grandmaster failure: gm stops, gm-backup (1 s off) takes over
 #   3. grandmaster returns
-# Throughout, the GM also serves IEEE 1588 over UDP to ptp-device (ptp4l).
+# Throughout, the GM also serves IEEE 1588 over UDP to ptp-device (ptp4l)
+# and monitor-1588; monitor-l2 watches ptp4l as a 1588 master over Ethernet.
 # Logs, metrics and captures are collected in lab/out/<UTC time>/.
 
 set -euo pipefail
@@ -24,7 +25,7 @@ FAILED=0
 
 collect() {
     "${DC[@]}" logs --no-color --no-log-prefix monitor >"$OUT/monitor.log" 2>&1 || true
-    for svc in gm gm-backup switch ptp-device; do
+    for svc in gm gm-backup switch ptp-device monitor-1588 ptp-master monitor-l2; do
         "${DC[@]}" logs --no-color --no-log-prefix "$svc" >"$OUT/$svc.log" 2>&1 || true
     done
     "${DC[@]}" cp monitor:/out/. "$OUT/" >/dev/null 2>&1 || true
@@ -52,7 +53,8 @@ step() {
 
 step "starting lab (build may take a few minutes the first time)"
 "${DC[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-"${DC[@]}" up -d --build --wait gm gm-backup monitor ptp-device
+"${DC[@]}" up -d --build --wait gm gm-backup monitor ptp-device monitor-1588 \
+    ptp-master monitor-l2
 echo "   monitor learning the master for 20 s"
 sleep 20
 
@@ -96,6 +98,12 @@ fi
 check 'ptp1588: UDP.* delay_resp_tx=[1-9]' "GM serves IEEE 1588 beside gPTP (Delay_Req answered)" gm
 check 'UNCALIBRATED on RS_SLAVE' "1588 device (ptp4l) follows the GM" ptp-device
 check 'rms +[0-9]+ max' "1588 device measures its offset to the GM" ptp-device
+check 'Following master port .*class 248' "1588 monitor follows the GM over UDP" monitor-1588
+check 'Path delay to the master \(E2E\)' "1588 monitor measures the path delay (E2E)" monitor-1588
+check '^sync: locked protocol="PTP' "1588 monitor locks to the GM" monitor-1588
+check 'Following master port .*prio1 10,' "1588 monitor follows ptp4l over Ethernet" monitor-l2
+check 'Path delay to the master \(E2E\)' "ptp4l answers the monitor's Delay_Req" monitor-l2
+check '^sync: locked protocol="PTP' "1588 monitor locks to ptp4l" monitor-l2
 captures=("$OUT"/captures/sync-*.csv)
 if [[ -f ${captures[0]} ]]; then
     echo "  ok    ${#captures[@]} capture file(s) written"

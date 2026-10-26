@@ -162,10 +162,11 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
             if let Some(sm) = &st.sync {
                 let ns = |v: Option<f64>| v.map_or("-".into(), monitor::fmt_ns);
                 println!(
-                    "sync: {} gm={} offset_to_system={} residual={} rms={} peak={} \
+                    "sync: {} protocol=\"{}\" gm={} offset_to_system={} residual={} rms={} peak={} \
                      drift={} steps={} spikes={} freq_changes={} relearns={} bursts={} gm_changes={} \
                      sync_timeouts={} missing_syncs={} missing_fups={}",
                     sm.state.label(),
+                    sm.protocol,
                     sm.gm.map_or("-".into(), |g| ptp::fmt_clock_identity(&g.gm_identity)),
                     ns(sm.offset_to_system_ns),
                     ns(sm.residual_ns),

@@ -140,6 +140,15 @@ pub enum Msg {
         source: [u8; 10],
         correction_ns: i64,
     },
+    /// 1588 answer to a Delay_Req: the master's receive time of it.
+    DelayResp {
+        source: [u8; 10],
+        seq: u16,
+        log_interval: i8,
+        receive: Timestamp,
+        requesting: [u8; 10],
+        correction_ns: i64,
+    },
     PdelayResp {
         source: [u8; 10],
         seq: u16,
@@ -246,6 +255,21 @@ pub fn parse(buf: &[u8]) -> Option<Msg> {
             source,
             correction_ns,
         }),
+        MT_DELAY_RESP => {
+            if length < HDR_LEN + 20 {
+                return None;
+            }
+            let mut requesting = [0u8; 10];
+            requesting.copy_from_slice(&buf[44..54]);
+            Some(Msg::DelayResp {
+                source,
+                seq,
+                log_interval,
+                receive: Timestamp::parse(&buf[34..44]),
+                requesting,
+                correction_ns,
+            })
+        }
         MT_PDELAY_RESP => {
             if length < HDR_LEN + 20 {
                 return None;
@@ -407,6 +431,11 @@ impl MsgBuilder {
         b
     }
 
+    /// 1588 Delay_Req (two-step: originTimestamp left zero).
+    pub fn delay_req(&self, seq: u16) -> Vec<u8> {
+        self.header(MT_DELAY_REQ, HDR_LEN + 10, 0, seq, 1, 0x7F)
+    }
+
     pub fn pdelay_req(&self, seq: u16) -> Vec<u8> {
         self.header(MT_PDELAY_REQ, HDR_LEN + 20, 0, seq, 5, 0)
     }
@@ -489,7 +518,8 @@ mod tests {
             port_number: 1,
             domain: 4,
         }
-        .header(MT_DELAY_REQ, HDR_LEN + 10, 0, 77, 1, 0x7F);
+        .delay_req(77);
+        assert_eq!((req.len(), req[0], req[32], req[33]), (44, 0x01, 1, 0x7F));
         req[8..16].copy_from_slice(&(12i64 << 16).to_be_bytes());
         let Some(Msg::DelayReq {
             seq,
@@ -511,6 +541,16 @@ mod tests {
         assert_eq!(&resp[8..16], &(12i64 << 16).to_be_bytes());
         assert_eq!(Timestamp::parse(&resp[34..44]), t4);
         assert_eq!(&resp[44..54], &source);
+        match parse(&resp) {
+            Some(Msg::DelayResp {
+                seq: 77,
+                receive,
+                requesting,
+                correction_ns: 12,
+                ..
+            }) => assert_eq!((receive, requesting), (t4, source)),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
