@@ -474,7 +474,7 @@ fn time_sync_rows(sm: &SyncMonitor) -> u16 {
     match sm.time_sync {
         None => 0,
         Some(TimeSync::Builtin) => sm.clocks.len().max(1) as u16 + 1,
-        Some(TimeSync::Linuxptp) => 2,
+        Some(TimeSync::Linuxptp | TimeSync::Ntp) => 2,
     }
 }
 
@@ -525,12 +525,12 @@ fn draw_time_sync(f: &mut Frame, area: Rect, sm: &SyncMonitor) {
                 lines.push(Line::from(spans));
             }
         }
-        Some(TimeSync::Linuxptp) => {
+        Some(mode @ (TimeSync::Linuxptp | TimeSync::Ntp)) => {
             let status = sm
                 .linuxptp_status
                 .clone()
                 .unwrap_or_else(|| "checking…".into());
-            let healthy = status.split(", ").all(|u| u.ends_with(": active"));
+            let healthy = status.split(", ").all(|u| u.contains(": active"));
             lines.push(Line::from(vec![
                 Span::styled("units  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -543,7 +543,11 @@ fn draw_time_sync(f: &mut Frame, area: Rect, sm: &SyncMonitor) {
                 ),
             ]));
             lines.push(Line::from(Span::styled(
-                "monitor listen-only beside ptp4l; system clock checked against the master's UTC",
+                if mode == TimeSync::Ntp {
+                    "system clock from NTP; checked against the master's UTC"
+                } else {
+                    "monitor listen-only beside ptp4l; system clock checked against the master's UTC"
+                },
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -551,6 +555,7 @@ fn draw_time_sync(f: &mut Frame, area: Rect, sm: &SyncMonitor) {
     }
     let title = match sm.time_sync {
         Some(TimeSync::Builtin) => format!(" Time sync — built-in servo, {utc} "),
+        Some(TimeSync::Ntp) => format!(" Time sync — NTP, {utc} "),
         _ => format!(" Time sync — linuxptp, {utc} "),
     };
     f.render_widget(

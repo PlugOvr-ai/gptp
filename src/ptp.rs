@@ -436,8 +436,8 @@ impl MsgBuilder {
         self.header(MT_DELAY_REQ, HDR_LEN + 10, 0, seq, 1, 0x7F)
     }
 
-    pub fn pdelay_req(&self, seq: u16) -> Vec<u8> {
-        self.header(MT_PDELAY_REQ, HDR_LEN + 20, 0, seq, 5, 0)
+    pub fn pdelay_req(&self, seq: u16, log_interval: i8) -> Vec<u8> {
+        self.header(MT_PDELAY_REQ, HDR_LEN + 20, 0, seq, 5, log_interval)
     }
 
     pub fn pdelay_resp(&self, req_seq: u16, requesting: &[u8; 10], t2: Timestamp) -> Vec<u8> {

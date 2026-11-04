@@ -197,7 +197,12 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
                     );
                 }
                 if let Some(l) = &sm.linuxptp_status {
-                    println!("linuxptp: {l}");
+                    let label = if sm.time_sync == Some(config::TimeSync::Ntp) {
+                        "ntp"
+                    } else {
+                        "linuxptp"
+                    };
+                    println!("{label}: {l}");
                 }
             }
             if let Some(p) = &st.ptp1588 {

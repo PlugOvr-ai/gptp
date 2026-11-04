@@ -24,11 +24,12 @@ master's time for jumps and instability instead.
   still outrank us, the TUI shows a red warning.
 - **Timed handover** (`--handover <minutes>`): after x minutes the program
   stops sending Announce/Sync. The other devices' announce-receipt timeout
-  (3 announce intervals ≈ 3 s) then makes the BMCA elect the next-best
+  (3 announce intervals ≈ 3 s at the default rate) then makes the BMCA elect the next-best
   master — the automotive Ethernet switch. The peer-delay responder stays
   active so neighbors keep their `asCapable` state across the handover.
 - **Peer delay**: answers `Pdelay_Req` from neighbors (two-step) and runs its
-  own peer-delay measurement once per second; the measured link delay is
+  own peer-delay measurement (once per second by default,
+  `--log-pdelay-req-interval`); the measured link delay is
   shown in the TUI.
 - **TUI status console** (ratatui): role banner (ACTIVE GRANDMASTER /
   PASSIVE), handover countdown gauge, clock identity/priorities, TAI time
@@ -182,6 +183,9 @@ master's time for jumps and instability instead.
     by `--setup-time-sync linuxptp` and alarms when the system clock is far
     off the master's UTC (whole TAI−UTC seconds point to a system clock on
     TAI or a master announcing a wrong UTC offset); it runs listen-only.
+  - **`ntp`** — the system clock comes from NTP (systemd-timesyncd), not
+    from the master; gptp-gm checks that timesyncd runs and alarms when the
+    system clock is far off the master's UTC. The installer's default.
 
   **UTC offset**: PTP time is TAI, the system clock UTC; TAI − UTC = 37 s
   since 2017 (10 s in 1972 + 27 leap seconds; leap seconds end by 2035).
@@ -189,10 +193,12 @@ master's time for jumps and instability instead.
   otherwise `--utc-offset` (37). Our grandmaster now also marks its
   announced offset valid.
 
-  **Setup** (`--setup-time-sync MODE [--sync-phc …] [--dry-run]`, as root,
-  one-shot): disables conflicting time services (systemd-timesyncd,
-  chrony, ntpd, other ptp4l/phc2sys/timemaster units — masked ones are left
-  alone) and records them; for `linuxptp` it also writes
+  **Setup** (`--setup-time-sync [MODE] [--sync-phc …] [--dry-run]`, as
+  root, one-shot, MODE defaults to `ntp`, nothing is asked): disables
+  conflicting time services (chrony, ntpd, ntpsec, openntpd, other
+  ptp4l/phc2sys/timemaster units, and systemd-timesyncd except for `ntp`,
+  which enables it instead — masked ones are left alone) and records them;
+  for `linuxptp` it also writes
   `/etc/linuxptp/gptp-gm-<iface>.cfg` (802.1AS: L2, P2P, transportSpecific
   1, hardware timestamping where the NIC has a PHC, explicit `utc_offset`,
   own management sockets) and the units `gptp-ptp4l-<iface>`,
@@ -231,10 +237,19 @@ curl -fsSL https://github.com/PlugOvr-ai/gptp/releases/latest/download/install.s
     --time-sync linuxptp --sync-phc mgbe3_0
 ```
 
-With `--time-sync` the installer runs `--setup-time-sync` (disabling
-conflicting time services, recorded) and gives the service
-`CAP_SYS_TIME` for `builtin`; `--uninstall` undoes the setup and
-re-enables the disabled services.
+**Time source: NTP by default.** Every install with an interface runs
+`--setup-time-sync` without asking: by default `ntp` — the system clock
+comes from systemd-timesyncd, and chrony, ntpd, other ptp4l/phc2sys etc.
+are disabled; the monitor gets `--time-sync ntp` and checks the clock
+against the master. Where chrony's package excludes systemd-timesyncd's
+(Debian/Ubuntu), the installer installs systemd-timesyncd with apt, which
+replaces chrony. With `--ntp-once` or `--seed-from-gnss` (and for a monitor
+beside an `--ntp-once` grandmaster) every time service is disabled instead,
+timesyncd too, since those set the clock themselves. `--time-sync
+builtin|linuxptp` (monitor) sets up that mode, with `CAP_SYS_TIME` for
+`builtin`; `--time-sync none` leaves the time services alone. Everything
+is recorded: uninstalling the last service re-enables what was disabled,
+disables what was enabled and reinstalls replaced packages such as chrony.
 
 **Grandmaster without a battery-backed RTC** (e.g. a Raspberry Pi 5
 without its battery): it boots with a stale clock (the RTC reads 1970;
@@ -256,7 +271,7 @@ previous state is recorded in `/etc/gptp-gm/ntp-once.state` and restored by
 installer environment, written to the unit, counted on `/proc/uptime` so the
 NTP step itself cannot trip it); on expiry the grandmaster starts anyway
 with a WARNING in the journal — a GM with the wrong time beats no GM. Not
-combinable with `--time-sync` (there the master sets the clock).
+combinable with `--time-sync ntp|builtin|linuxptp`.
 
 The installer picks the binary for the CPU, verifies its SHA-256, and
 installs it to `/usr/local/bin/gptp-gm`. Run it again without arguments to
@@ -316,9 +331,9 @@ Selected options (see `--help` for all):
 | `--freq-threshold <ppb>` | 100 / 5000 | monitor: frequency-change threshold (HW / SW) |
 | `--capture-dir <dir>` | off | monitor: per-Sync CSV around every alarm |
 | `--listen-only` | auto | monitor: send nothing (automatic when ptp4l runs) |
-| `--time-sync <builtin\|linuxptp>` | off | monitor: keep this machine's clocks on the master |
+| `--time-sync <builtin\|linuxptp\|ntp>` | off (installer: `ntp`) | monitor: keep this machine's clocks on the master, or check NTP's against it |
 | `--sync-phc <iface>` | — | also sync this NIC's hardware clock (repeatable) |
-| `--setup-time-sync <mode>` | — | one-shot system setup for the mode, then exit (root) |
+| `--setup-time-sync [mode]` | — | one-shot system setup for the mode (default `ntp`), then exit (root) |
 | `--remove-time-sync` | — | undo the setup, restore disabled services |
 | `--dry-run` | off | with setup/remove: print the changes only |
 | `--priority1 <n>` | 1 | grandmasterPriority1, lower wins the BMCA |
@@ -327,6 +342,8 @@ Selected options (see `--help` for all):
 | `--time-source <n>` | 0xA0 | advertised timeSource (0x20 GPS, 0x50 NTP) |
 | `--domain <n>` | 0 | gPTP domain |
 | `--log-sync-interval <n>` | -3 | log2 Sync interval (-3 = 8/s) |
+| `--log-announce-interval <n>` | 0 | log2 Announce interval (0 = 1/s, 1 = every 2 s; -3..4). Peers time out after 3 intervals, so slower also delays the takeover after a handover |
+| `--log-pdelay-req-interval <n>` | 0 | log2 Pdelay_Req interval of our own peer-delay measurement (0 = 1/s; -3..5); requests from neighbors are always answered |
 | `--utc-offset <s>` | 37 | UTC→TAI offset when the kernel TAI offset is unset |
 | `--gm-clock <src>` | auto | time source: `phc-disciplined` with hardware timestamps, else `system`; or `phc` (free-running NIC clock) |
 | `--seed-from-gnss` | off | before announcing, take time and frequency from a GNSS-locked master on the network (clockClass 6/7), then take over; `--seed-wait <s>` (60) |

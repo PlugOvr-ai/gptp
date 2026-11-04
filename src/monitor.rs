@@ -841,6 +841,7 @@ pub fn run(
                 None => "; no clock is adjusted",
                 Some(TimeSync::Builtin) => "; time sync: built-in servo",
                 Some(TimeSync::Linuxptp) => "; time sync: linuxptp",
+                Some(TimeSync::Ntp) => "; system clock from NTP, checked against the master",
             }
         ));
         if hw {
@@ -917,7 +918,7 @@ pub fn run(
     let mut linuxptp_checked: Option<Instant> = None;
     let mut utc_logged: Option<(i32, bool)> = None;
 
-    let mut pdelay = PeerDelay::new(start);
+    let mut pdelay = PeerDelay::new(start, cfg.log_pdelay_req_interval);
     let mut e2e = E2eDelay::new();
     let mut analyzer = Analyzer::new(th);
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -974,15 +975,21 @@ pub fn run(
                 }
             }
         }
-        if cfg.time_sync == Some(TimeSync::Linuxptp)
+        if matches!(cfg.time_sync, Some(TimeSync::Linuxptp | TimeSync::Ntp))
             && linuxptp_checked.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(10))
         {
             linuxptp_checked = Some(now);
-            let status = crate::timesync_setup::unit_status();
+            let status = if cfg.time_sync == Some(TimeSync::Ntp) {
+                crate::timesync_setup::ntp_status()
+            } else {
+                crate::timesync_setup::unit_status()
+            };
             let mut st = state.lock().unwrap();
             let sm = st.sync.as_mut().unwrap();
-            let failed: Vec<&(String, String)> =
-                status.iter().filter(|(_, s)| s != "active").collect();
+            let failed: Vec<&(String, String)> = status
+                .iter()
+                .filter(|(_, s)| !s.starts_with("active"))
+                .collect();
             let line = if status.is_empty() {
                 "no units set up — run --setup-time-sync linuxptp".to_string()
             } else {
@@ -995,7 +1002,14 @@ pub fn run(
             let changed = sm.linuxptp_status.as_deref() != Some(line.as_str());
             sm.linuxptp_status = Some(line.clone());
             if changed && (!failed.is_empty() || status.is_empty()) {
-                st.log(format!("ALARM: linuxptp time sync not healthy — {line}"));
+                st.log(format!(
+                    "ALARM: {} time sync not healthy — {line}",
+                    if cfg.time_sync == Some(TimeSync::Ntp) {
+                        "NTP"
+                    } else {
+                        "linuxptp"
+                    }
+                ));
             }
         }
 
@@ -1260,7 +1274,10 @@ pub fn run(
                                     diag: &mut diag,
                                     engine: engine.as_mut(),
                                     utc_offset: utc_now,
-                                    check_system: cfg.time_sync == Some(TimeSync::Linuxptp),
+                                    check_system: matches!(
+                                        cfg.time_sync,
+                                        Some(TimeSync::Linuxptp | TimeSync::Ntp)
+                                    ),
                                     clock: &clock,
                                     state: &state,
                                     blame: &mut blame,
@@ -1323,7 +1340,10 @@ pub fn run(
                                     diag: &mut diag,
                                     engine: engine.as_mut(),
                                     utc_offset: utc_now,
-                                    check_system: cfg.time_sync == Some(TimeSync::Linuxptp),
+                                    check_system: matches!(
+                                        cfg.time_sync,
+                                        Some(TimeSync::Linuxptp | TimeSync::Ntp)
+                                    ),
                                     clock: &clock,
                                     state: &state,
                                     blame: &mut blame,

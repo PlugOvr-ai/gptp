@@ -12,6 +12,12 @@
 #                                                                        # slave monitor: gptp-monitor.service
 #   curl -fsSL .../install.sh | sudo sh -s -- --uninstall [gm|monitor]   # remove service(s); binary when unused
 #
+# Time source: by default the system clock comes from NTP (systemd-timesyncd),
+# and other time services (chrony, ntpd, ptp4l/phc2sys, ...) are disabled
+# without asking - for the grandmaster and the monitor (which then checks the
+# clock against the master). --time-sync none leaves them alone; with
+# --ntp-once or --seed-from-gnss all of them are disabled, timesyncd too.
+#
 # Slave monitor that also keeps this machine's time in sync with the master:
 #
 #   ... | sudo sh -s -- eth0 --monitor --time-sync builtin [--sync-phc eth1]
@@ -22,7 +28,7 @@
 #        monitors listen-only beside it
 #
 # Both disable conflicting time services (systemd-timesyncd, chrony, ntpd,
-# other ptp4l/phc2sys); --uninstall restores them.
+# other ptp4l/phc2sys); --uninstall restores them (once no service is left).
 #
 # Grandmaster without a battery-backed RTC (e.g. Raspberry Pi 5): set the
 # clock once per start from NTP, then freeze it, so no NTP step or slew
@@ -140,6 +146,50 @@ restore_ntp() {
     say "Restored systemd-timesyncd (${prev:-disabled})"
 }
 
+# NTP clients whose packages exclude systemd-timesyncd's (Debian/Ubuntu:
+# all provide time-daemon). Installing timesyncd removes them; recorded here
+# and reinstalled by --uninstall.
+REPLACED=/etc/gptp-gm/replaced-packages
+
+# systemd-timesyncd installed and usable, replacing e.g. chrony if needed.
+ensure_timesyncd() {
+    systemctl cat systemd-timesyncd.service >/dev/null 2>&1 && return 0
+    command -v apt-get >/dev/null 2>&1 || return 1
+    gone="$(dpkg-query -W -f '${Package} ${db:Status-Status}\n' chrony ntp ntpsec openntpd 2>/dev/null \
+        | awk '$2 == "installed" { print $1 }' | tr '\n' ' ')"
+    say "Installing systemd-timesyncd${gone:+ (replaces $gone- reinstalled by --uninstall)}..."
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -q systemd-timesyncd >/dev/null || return 1
+    # Removing a package leaves its daemon running.
+    for svc in chrony chronyd ntp ntpd ntpsec openntpd; do
+        $SUDO systemctl stop "$svc.service" >/dev/null 2>&1 || true
+    done
+    if [ -n "$gone" ]; then
+        $SUDO mkdir -p "$(dirname "$REPLACED")"
+        for p in $gone; do
+            grep -qsx "$p" "$REPLACED" || echo "$p" | $SUDO tee -a "$REPLACED" >/dev/null
+        done
+    fi
+    systemctl cat systemd-timesyncd.service >/dev/null 2>&1
+}
+
+# Undo ensure_timesyncd: the NTP client packages it replaced come back.
+restore_packages() {
+    [ -s "$REPLACED" ] || return 0
+    pkgs="$(tr '\n' ' ' <"$REPLACED")"
+    say "Reinstalling $pkgs(replaced by systemd-timesyncd)..."
+    # shellcheck disable=SC2086
+    if $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -q $pkgs >/dev/null; then
+        for svc in chrony chronyd ntp ntpd ntpsec openntpd; do
+            if systemctl cat "$svc.service" >/dev/null 2>&1; then
+                $SUDO systemctl enable --now "$svc.service" >/dev/null 2>&1 || true
+            fi
+        done
+        $SUDO rm -f "$REPLACED"
+    else
+        say "warning: reinstalling $pkgs failed - install them yourself: sudo apt-get install $pkgs"
+    fi
+}
+
 # --- Uninstall -------------------------------------------------------------------------------
 if [ "${1:-}" = "--uninstall" ]; then
     case "${2:-all}" in
@@ -147,13 +197,6 @@ if [ "${1:-}" = "--uninstall" ]; then
         monitor) remove="gptp-monitor" ;;
         all) remove="gptp-gm gptp-monitor" ;;
         *) die "--uninstall takes gm, monitor, or nothing" ;;
-    esac
-    case " $remove " in
-        *" gptp-monitor "*)
-            if [ -e /etc/gptp-gm/time-sync.state ] && [ -x "$BIN" ]; then
-                $SUDO "$BIN" --remove-time-sync || say "warning: undoing the time sync setup failed"
-            fi
-            ;;
     esac
     for svc in $remove; do
         if [ -e "$(unit_path "$svc")" ]; then
@@ -163,6 +206,14 @@ if [ "${1:-}" = "--uninstall" ]; then
         fi
     done
     case " $remove " in *" gptp-gm "*) restore_ntp ;; esac
+    # The time services setup is shared: undone with the last service.
+    if [ ! -e "$(unit_path gptp-gm)" ] && [ ! -e "$(unit_path gptp-monitor)" ] \
+        && [ -e /etc/gptp-gm/time-sync.state ] && [ -x "$BIN" ]; then
+        $SUDO "$BIN" --remove-time-sync || say "warning: undoing the time sync setup failed"
+    fi
+    if [ ! -e "$(unit_path gptp-gm)" ] && [ ! -e "$(unit_path gptp-monitor)" ]; then
+        restore_packages
+    fi
     if have_systemd; then $SUDO systemctl daemon-reload; fi
     if [ -e "$(unit_path gptp-gm)" ] || [ -e "$(unit_path gptp-monitor)" ]; then
         say "Kept $BIN (still used by an installed service)"
@@ -219,32 +270,44 @@ for arg in "$@"; do
     prev="$arg"
 done
 case "$TIME_SYNC" in
-    "") ;;
+    "" | none | ntp | builtin | linuxptp) ;;
     servo) TIME_SYNC=builtin ;;
-    builtin | linuxptp) ;;
-    *) die "--time-sync takes builtin or linuxptp, got $TIME_SYNC" ;;
+    *) die "--time-sync takes ntp, builtin, linuxptp or none, got $TIME_SYNC" ;;
+esac
+# What --setup-time-sync configures: NTP unless told otherwise; --ntp-once
+# and --seed-from-gnss set the clock themselves, so nothing else may (also
+# not a monitor installed beside an --ntp-once grandmaster).
+case "$TIME_SYNC" in
+    none) SETUP="" ;;
+    "")
+        if [ -n "$NTP_ONCE" ] || [ "$SEED" -eq 1 ] || { [ "$MONITOR" -eq 1 ] && [ -e "$NTP_STATE" ]; }; then
+            SETUP=builtin
+        else
+            SETUP=ntp
+        fi
+        ;;
+    *) SETUP="$TIME_SYNC" ;;
 esac
 GM_PREP_MAX_WAIT="${GM_PREP_MAX_WAIT:-600}"
 if [ -n "$NTP_ONCE" ]; then
-    [ -z "$TIME_SYNC" ] || die "--ntp-once and --time-sync exclude each other: with --time-sync the master sets the clock"
+    case "$TIME_SYNC" in "" | none) ;; *) die "--ntp-once and --time-sync $TIME_SYNC exclude each other: --ntp-once sets the clock" ;; esac
     [ "$MONITOR" -eq 0 ] || die "--ntp-once is for the grandmaster, not with --monitor"
     case "$NTP_ONCE" in -*) die "--ntp-once needs the router's address, got $NTP_ONCE" ;; esac
     INTERNET_CHECK="${INTERNET_CHECK:-1.1.1.1,google.com}"
     case "$GM_PREP_MAX_WAIT" in "" | *[!0-9]*) die "GM_PREP_MAX_WAIT must be seconds, got $GM_PREP_MAX_WAIT" ;; esac
     command -v ping >/dev/null 2>&1 || die "--ntp-once needs ping (apt install iputils-ping)"
-    systemctl cat systemd-timesyncd.service >/dev/null 2>&1 \
-        || die "--ntp-once needs systemd-timesyncd, installed and not masked (apt install systemd-timesyncd)"
-    for svc in chrony chronyd ntp ntpd ntpsec openntpd; do
-        if systemctl is-active -q "$svc" 2>/dev/null; then
-            say "warning: $svc is running and keeps adjusting the clock the grandmaster serves - disable it for --ntp-once"
-        fi
-    done
+    systemctl cat systemd-timesyncd.service >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1 \
+        || die "--ntp-once needs systemd-timesyncd, installed and not masked"
 elif [ -n "$INTERNET_CHECK" ]; then
     die "--internet-check needs --ntp-once"
 fi
-[ -z "$TIME_SYNC" ] || [ "$MONITOR" -eq 1 ] || die "--time-sync needs --monitor"
+case "$TIME_SYNC" in
+    builtin | linuxptp) [ "$MONITOR" -eq 1 ] || die "--time-sync $TIME_SYNC needs --monitor" ;;
+    ntp) [ "$SEED" -eq 0 ] || die "--seed-from-gnss and --time-sync ntp exclude each other: NTP would pull the seeded clock away" ;;
+esac
 # The service command line: phc2sys does the --sync-phc work with linuxptp,
-# the --ntp-once gate the installer's own options.
+# the --ntp-once gate the installer's own options; --time-sync is the
+# installer's for the grandmaster and set here for the monitor.
 SERVICE_ARGS=""
 skip=0
 for arg in "$@"; do
@@ -253,8 +316,8 @@ for arg in "$@"; do
         continue
     fi
     case "$arg" in
-        --ntp-once | --internet-check) skip=1 && continue ;;
-        --ntp-once=* | --internet-check=*) continue ;;
+        --ntp-once | --internet-check | --time-sync) skip=1 && continue ;;
+        --ntp-once=* | --internet-check=* | --time-sync=*) continue ;;
     esac
     if [ "$TIME_SYNC" = linuxptp ]; then
         case "$arg" in
@@ -264,6 +327,14 @@ for arg in "$@"; do
     fi
     SERVICE_ARGS="$SERVICE_ARGS $arg"
 done
+# The monitor's own mode: as given, or checking NTP when that is the default.
+if [ "$MONITOR" -eq 1 ]; then
+    case "$TIME_SYNC" in
+        none) ;;
+        "") [ "$SETUP" != ntp ] || SERVICE_ARGS="$SERVICE_ARGS --time-sync ntp" ;;
+        *) SERVICE_ARGS="$SERVICE_ARGS --time-sync $TIME_SYNC" ;;
+    esac
+fi
 for path in "$METRICS_FILE" "$CAPTURE_DIR"; do
     case "$path" in
         "" | /*) ;;
@@ -412,16 +483,6 @@ if [ -z "$IFACE" ]; then
     exit 0
 fi
 
-# --- Time sync (one-shot system configuration) ------------------------------------------------
-if [ -n "$TIME_SYNC" ]; then
-    setup_args=""
-    for phc in $SYNC_PHCS; do setup_args="$setup_args --sync-phc $phc"; done
-    say "Configuring time sync ($TIME_SYNC)..."
-    # shellcheck disable=SC2086
-    $SUDO "$BIN" "$IFACE" --setup-time-sync "$TIME_SYNC" $setup_args $SETUP_EXTRA \
-        || die "time sync setup failed (see above)"
-fi
-
 # --- Service ---------------------------------------------------------------------------------
 if [ "$MONITOR" -eq 1 ]; then
     SERVICE=gptp-monitor OTHER=gptp-gm OTHER_ARG=gm DESCRIPTION="gPTP slave monitor on $IFACE"
@@ -447,6 +508,15 @@ esac
 # --ptp udp binds the PTP ports 319/320.
 [ "$PTP" != udp ] || CAPS_EXTRA="$CAPS_EXTRA CAP_NET_BIND_SERVICE"
 
+if [ "$SETUP" = ntp ] || [ -n "$NTP_ONCE" ]; then
+    if ! ensure_timesyncd; then
+        [ -z "$NTP_ONCE" ] || die "--ntp-once needs systemd-timesyncd (installing it failed)"
+        say "warning: systemd-timesyncd is not available - the time services were left alone"
+        SETUP=""
+        [ "$MONITOR" -eq 0 ] || [ -n "$TIME_SYNC" ] || SERVICE_ARGS="${SERVICE_ARGS% --time-sync ntp}"
+    fi
+fi
+
 GATE_LINES=""
 if [ -n "$NTP_ONCE" ]; then
     $SUDO mkdir -p "$(dirname "$NTP_STATE")"
@@ -465,6 +535,19 @@ ExecStartPre=+$GATE $NTP_ONCE $INTERNET_CHECK
 TimeoutStartSec=infinity"
 elif [ "$MONITOR" -eq 0 ]; then
     restore_ntp # reinstalled without --ntp-once
+fi
+
+# --- Time sync (one-shot system configuration) ------------------------------------------------
+# After the --ntp-once step, which owns systemd-timesyncd.
+if [ -n "$SETUP" ]; then
+    setup_args=""
+    for phc in $SYNC_PHCS; do setup_args="$setup_args --sync-phc $phc"; done
+    say "Configuring time sync ($SETUP)..."
+    # shellcheck disable=SC2086
+    if ! $SUDO "$BIN" "$IFACE" --setup-time-sync "$SETUP" $setup_args $SETUP_EXTRA; then
+        [ -z "$TIME_SYNC" ] || die "time sync setup failed (see above)"
+        say "warning: time sync setup failed (see above) - other time services were left alone"
+    fi
 fi
 
 RW_DIRS=""

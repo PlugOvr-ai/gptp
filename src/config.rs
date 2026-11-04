@@ -14,6 +14,10 @@ pub enum TimeSync {
     /// NIC hardware clocks and the system clock in sync; gptp-gm monitors
     /// listen-only beside it
     Linuxptp,
+    /// NTP (systemd-timesyncd) keeps the system clock; other time services
+    /// such as chrony are disabled by --setup-time-sync. The monitor checks
+    /// the system clock against the master's UTC
+    Ntp,
 }
 
 /// Transport of the IEEE 1588 PTP served beside gPTP (`--ptp`).
@@ -157,11 +161,18 @@ pub struct Config {
     #[arg(long, value_name = "MODE", requires = "monitor")]
     pub time_sync: Option<TimeSync>,
 
-    /// Configure this system for --time-sync MODE and exit (as root):
-    /// disables conflicting time services (recorded, restored by
-    /// --remove-time-sync); for linuxptp also writes the gPTP ptp4l config
-    /// and ptp4l/phc2sys systemd units for this interface
-    #[arg(long, value_name = "MODE", conflicts_with = "remove_time_sync")]
+    /// Configure this system for --time-sync MODE (default ntp) and exit
+    /// (as root), without asking: disables conflicting time services such
+    /// as chrony (recorded, restored by --remove-time-sync); ntp enables
+    /// systemd-timesyncd; linuxptp also writes the gPTP ptp4l config and
+    /// ptp4l/phc2sys systemd units for this interface
+    #[arg(
+        long,
+        value_name = "MODE",
+        num_args = 0..=1,
+        default_missing_value = "ntp",
+        conflicts_with = "remove_time_sync"
+    )]
     pub setup_time_sync: Option<TimeSync>,
 
     /// Also keep this NIC's hardware clock in sync, e.g. a second port used
@@ -219,9 +230,29 @@ pub struct Config {
     #[arg(long, default_value_t = -3)]
     pub log_sync_interval: i8,
 
-    /// log2 of the Announce interval in seconds (0 = 1 per second, gPTP default)
-    #[arg(long, default_value_t = 0)]
+    /// log2 of the Announce interval in seconds (0 = 1 per second, gPTP
+    /// default). Other devices time out a GM after 3 Announce intervals, so a
+    /// slower rate also delays the takeover after a handover or failure.
+    #[arg(
+        long,
+        value_name = "LOG2",
+        default_value_t = 0,
+        allow_negative_numbers = true,
+        value_parser = clap::value_parser!(i8).range(-3..=4)
+    )]
     pub log_announce_interval: i8,
+
+    /// log2 of the Pdelay_Req interval in seconds (0 = 1 per second, gPTP
+    /// default), for the peer-delay measurement to the neighbor. Requests
+    /// from the neighbor are answered regardless.
+    #[arg(
+        long,
+        value_name = "LOG2",
+        default_value_t = 0,
+        allow_negative_numbers = true,
+        value_parser = clap::value_parser!(i8).range(-3..=5)
+    )]
+    pub log_pdelay_req_interval: i8,
 
     /// UTC-to-TAI offset in seconds, used when the kernel TAI offset is unset
     #[arg(long, default_value_t = 37)]

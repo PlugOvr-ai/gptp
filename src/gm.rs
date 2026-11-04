@@ -142,7 +142,7 @@ pub fn run(
     let mut seq_sync: u16 = 0;
     let mut next_announce = start;
     let mut next_sync = start;
-    let mut pdelay = PeerDelay::new(start);
+    let mut pdelay = PeerDelay::new(start, cfg.log_pdelay_req_interval);
     // While seeding, the master we listen to is not a handover.
     let mut announced_foreign_takeover = seeder.is_some();
     let mut rxbuf = [0u8; 1600];

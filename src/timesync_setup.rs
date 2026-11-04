@@ -1,6 +1,9 @@
 //! One-shot system configuration for the slave's time sync
 //! (`--setup-time-sync MODE`, `--remove-time-sync`).
 //!
+//! - **ntp** (the default): systemd-timesyncd keeps the system clock from
+//!   NTP; every other time service (chrony, ntpd, ptp4l/phc2sys, ...) is
+//!   disabled, without asking.
 //! - **builtin**: only disables time services that would fight gptp-gm's
 //!   own clock servo (systemd-timesyncd, chrony, ntpd, ptp4l/phc2sys).
 //! - **linuxptp**: additionally writes a gPTP slave config for ptp4l and
@@ -8,8 +11,9 @@
 //!   NIC clock, UTC via an explicit TAI−UTC offset rather than trusting
 //!   what the master announces) and phc2sys per `--sync-phc` NIC.
 //!
-//! Everything disabled is recorded in the state file and re-enabled by
-//! `--remove-time-sync`; repeated setups keep the original record.
+//! Everything disabled (or enabled) is recorded in the state file and
+//! restored by `--remove-time-sync`; repeated setups keep the original
+//! record.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -22,6 +26,9 @@ use crate::config::{Config, TimeSync};
 const STATE_FILE: &str = "/etc/gptp-gm/time-sync.state";
 const UNIT_DIR: &str = "/etc/systemd/system";
 const LINUXPTP_DIR: &str = "/etc/linuxptp";
+const TIMESYNCD: &str = "systemd-timesyncd.service";
+/// systemd-timesyncd's flag file: the clock was synchronized since boot.
+const TIMESYNCD_SYNCED: &str = "/run/systemd/timesync/synchronized";
 
 /// Services that set the system clock themselves.
 const TIME_SERVICES: &[&str] = &[
@@ -44,6 +51,8 @@ pub struct Plan {
     pub units: Vec<String>,
     /// (service, "enabled" | "active") to disable and stop.
     pub disable: Vec<(String, String)>,
+    /// System services to enable and start (systemd-timesyncd for ntp).
+    pub enable: Vec<String>,
 }
 
 /// gPTP (802.1AS) slave settings for ptp4l on one interface. `ro_socket`:
@@ -149,10 +158,17 @@ pub fn plan(
         mode: match mode {
             TimeSync::Builtin => "builtin".into(),
             TimeSync::Linuxptp => "linuxptp".into(),
+            TimeSync::Ntp => "ntp".into(),
         },
         ..Default::default()
     };
     for (name, file_state, active) in units {
+        if mode == TimeSync::Ntp && name == TIMESYNCD {
+            if !file_state.starts_with("enabled") || active != "active" {
+                p.enable.push(name.clone());
+            }
+            continue;
+        }
         let ours = name.starts_with("gptp-");
         let template = name.contains("@.");
         let relevant = TIME_SERVICES.contains(&name.as_str())
@@ -168,7 +184,7 @@ pub fn plan(
             p.disable.push((name.clone(), "active".into()));
         }
     }
-    if mode == TimeSync::Builtin {
+    if mode != TimeSync::Linuxptp {
         return p;
     }
 
@@ -243,6 +259,8 @@ pub struct State {
     pub files: Vec<String>,
     pub units: Vec<String>,
     pub disabled: Vec<(String, String)>,
+    /// System services we enabled (disabled again on removal).
+    pub enabled: Vec<String>,
 }
 
 impl State {
@@ -256,6 +274,7 @@ impl State {
                 "mode" => s.mode = v.into(),
                 "file" => s.files.push(v.into()),
                 "unit" => s.units.push(v.into()),
+                "enabled" => s.enabled.push(v.into()),
                 "disabled" => {
                     if let Some((name, how)) = v.split_once(':') {
                         s.disabled.push((name.into(), how.into()));
@@ -278,6 +297,9 @@ impl State {
         }
         for (n, h) in &self.disabled {
             out += &format!("disabled={n}:{h}\n");
+        }
+        for n in &self.enabled {
+            out += &format!("enabled={n}\n");
         }
         out
     }
@@ -306,6 +328,49 @@ pub fn unit_status() -> Vec<(String, String)> {
             (u.trim_end_matches(".service").to_string(), s)
         })
         .collect()
+}
+
+/// systemd-timesyncd's state for the monitor with --time-sync ntp:
+/// ("systemd-timesyncd", "active, synchronized" / "active, not
+/// synchronized yet" / "inactive" ...).
+pub fn ntp_status() -> Vec<(String, String)> {
+    let active = Command::new("systemctl")
+        .args(["is-active", TIMESYNCD])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    let s = if active == "active" {
+        if Path::new(TIMESYNCD_SYNCED).exists() {
+            "active, synchronized".to_string()
+        } else {
+            "active, not synchronized yet".to_string()
+        }
+    } else {
+        active
+    };
+    vec![("systemd-timesyncd".into(), s)]
+}
+
+/// Merge a setup into the recorded state, relative to the system as it was
+/// before the first setup: undoing our own earlier change cancels it.
+fn merge(old: &State, plan: &Plan) -> (Vec<(String, String)>, Vec<String>) {
+    let mut disabled = old.disabled.clone();
+    let mut enabled = old.enabled.clone();
+    for d in &plan.disable {
+        if let Some(i) = enabled.iter().position(|n| n == &d.0) {
+            enabled.remove(i);
+        } else if !disabled.iter().any(|(n, _)| n == &d.0) {
+            disabled.push(d.clone());
+        }
+    }
+    for e in &plan.enable {
+        if let Some(i) = disabled.iter().position(|(n, _)| n == e) {
+            disabled.remove(i);
+        } else if !enabled.contains(e) {
+            enabled.push(e.clone());
+        }
+    }
+    (disabled, enabled)
 }
 
 /// Performs (or with --dry-run prints) the system changes.
@@ -456,6 +521,16 @@ pub fn setup(cfg: &Config, mode: TimeSync) -> Result<()> {
     } else {
         String::new()
     };
+    let units = list_units()?;
+    if mode == TimeSync::Ntp {
+        match units.iter().find(|(n, ..)| n == TIMESYNCD) {
+            None => bail!("ntp needs systemd-timesyncd (e.g. sudo apt install systemd-timesyncd)"),
+            Some((_, fs, _)) if fs == "masked" => {
+                bail!("systemd-timesyncd is masked (sudo systemctl unmask systemd-timesyncd)")
+            }
+            _ => {}
+        }
+    }
     let plan = plan(
         mode,
         iface,
@@ -466,7 +541,7 @@ pub fn setup(cfg: &Config, mode: TimeSync) -> Result<()> {
         &ptp4l,
         &version,
         &phc2sys,
-        &list_units()?,
+        &units,
     );
     let old = State::load().unwrap_or_default();
     let sys = Sys {
@@ -510,19 +585,18 @@ pub fn setup(cfg: &Config, mode: TimeSync) -> Result<()> {
         args.extend(plan.units.iter().map(|u| u.as_str()));
         sys.systemctl(&args)?;
     }
-
-    // Keep the original record of what we disabled across repeated setups.
-    let mut disabled = old.disabled.clone();
-    for d in &plan.disable {
-        if !disabled.iter().any(|(n, _)| n == &d.0) {
-            disabled.push(d.clone());
-        }
+    for name in &plan.enable {
+        sys.systemctl(&["enable", "--now", name])?;
     }
+
+    // Keep the original record of what we changed across repeated setups.
+    let (disabled, enabled) = merge(&old, &plan);
     let state = State {
         mode: plan.mode.clone(),
         files: plan.files.iter().map(|(p, _)| p.clone()).collect(),
         units: plan.units.clone(),
         disabled,
+        enabled,
     };
     sys.write(STATE_FILE, &state.render())?;
 
@@ -539,9 +613,19 @@ pub fn setup(cfg: &Config, mode: TimeSync) -> Result<()> {
                 .join(", ")
         );
     }
+    if !plan.enable.is_empty() {
+        println!(
+            "Enabled (disabled again by --remove-time-sync): {}",
+            plan.enable.join(", ")
+        );
+    }
     match mode {
+        TimeSync::Ntp => println!(
+            "The system clock now comes from NTP (systemd-timesyncd; servers: timedatectl \
+             show-timesync). Run the monitor with --time-sync ntp to check it against the master."
+        ),
         TimeSync::Builtin => println!(
-            "Run the monitor with --time-sync builtin (needs CAP_SYS_TIME){}.",
+            "No other time service adjusts the clock now. For the monitor to keep it: --time-sync builtin (needs CAP_SYS_TIME){}.",
             if cfg.sync_phc.is_empty() {
                 String::new()
             } else {
@@ -586,6 +670,11 @@ pub fn remove(cfg: &Config) -> Result<()> {
     }
     if !state.units.is_empty() {
         sys.systemctl(&["daemon-reload"])?;
+    }
+    for name in &state.enabled {
+        if let Err(e) = sys.systemctl(&["disable", "--now", name]) {
+            println!("  warning: could not disable {name} again: {e:#}");
+        }
     }
     for (name, how) in &state.disabled {
         let r = if how == "enabled" {
@@ -710,6 +799,76 @@ mod tests {
     }
 
     #[test]
+    fn ntp_plan_keeps_timesyncd_and_disables_the_rest() {
+        let mut u = units();
+        u[0] = (TIMESYNCD.into(), "disabled".into(), "inactive".into());
+        u.push(("chronyd.service".into(), "enabled".into(), "active".into()));
+        let p = plan(TimeSync::Ntp, "eth0", &[], true, 800, 37, "", "", "", &u);
+        assert!(p.files.is_empty() && p.units.is_empty());
+        assert_eq!(p.enable, [TIMESYNCD]);
+        let names: Vec<&str> = p.disable.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "ptp4l-mgbe0.service",
+                "phc2sys-mgbe0-sysclock.service",
+                "ptp4l@eth1.service",
+                "chronyd.service"
+            ]
+        );
+        // Already running: nothing to enable.
+        let p = plan(
+            TimeSync::Ntp,
+            "eth0",
+            &[],
+            true,
+            800,
+            37,
+            "",
+            "",
+            "",
+            &units(),
+        );
+        assert!(p.enable.is_empty());
+        assert!(!p.disable.iter().any(|(n, _)| n == TIMESYNCD));
+    }
+
+    #[test]
+    fn repeated_setups_record_changes_against_the_original_system() {
+        // timesyncd was disabled: ntp enables it, a later builtin setup
+        // disables it again — nothing left to restore for it.
+        let ntp = Plan {
+            enable: vec![TIMESYNCD.into()],
+            disable: vec![("chrony.service".into(), "enabled".into())],
+            ..Default::default()
+        };
+        let (d, e) = merge(&State::default(), &ntp);
+        assert_eq!(e, [TIMESYNCD]);
+        let old = State {
+            disabled: d,
+            enabled: e,
+            ..Default::default()
+        };
+        let builtin = Plan {
+            disable: vec![(TIMESYNCD.into(), "enabled".into())],
+            ..Default::default()
+        };
+        let (d, e) = merge(&old, &builtin);
+        assert!(e.is_empty());
+        assert_eq!(d, [("chrony.service".to_string(), "enabled".to_string())]);
+        // timesyncd was enabled: builtin disables it, ntp re-enables it.
+        let (d, e) = merge(&State::default(), &builtin);
+        let old = State {
+            disabled: d,
+            enabled: e,
+            ..Default::default()
+        };
+        let (d, e) = merge(&old, &ntp);
+        assert!(e.is_empty());
+        assert_eq!(d, [("chrony.service".to_string(), "enabled".to_string())]);
+    }
+
+    #[test]
     fn ro_socket_only_where_supported() {
         assert!(supports_ro_socket("4.0"));
         assert!(supports_ro_socket("3.1.1"));
@@ -729,6 +888,7 @@ mod tests {
                 ("chrony.service".into(), "enabled".into()),
                 ("ptp4l@eth1.service".into(), "active".into()),
             ],
+            enabled: vec![TIMESYNCD.into()],
         };
         assert_eq!(State::parse(&s.render()), s);
     }

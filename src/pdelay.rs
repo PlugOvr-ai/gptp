@@ -11,7 +11,6 @@ use crate::net::RawSock;
 use crate::ptp::{Msg, MsgBuilder, Timestamp};
 use crate::state::Status;
 
-const INTERVAL: Duration = Duration::from_secs(1);
 /// Measurements in the median filter. A cable's delay is constant, so a
 /// long median costs nothing and ignores disturbances of up to ~7 s
 /// (queueing, asymmetric congestion) entirely — an average would smear
@@ -33,6 +32,9 @@ struct Pending {
 pub struct PeerDelay {
     seq: u16,
     pub next: Instant,
+    interval: Duration,
+    /// log2 of `interval`, carried in the Pdelay_Req header.
+    log_interval: i8,
     pending: Option<Pending>,
     recent: VecDeque<f64>,
     /// Median of the recent measurements, ns.
@@ -40,10 +42,12 @@ pub struct PeerDelay {
 }
 
 impl PeerDelay {
-    pub fn new(start: Instant) -> Self {
+    pub fn new(start: Instant, log_interval: i8) -> Self {
         PeerDelay {
             seq: 0,
             next: start + Duration::from_millis(200),
+            interval: crate::gm::log_to_duration(log_interval),
+            log_interval,
             pending: None,
             recent: VecDeque::with_capacity(MEDIAN_OF + 1),
             link_delay_ns: None,
@@ -61,7 +65,7 @@ impl PeerDelay {
     ) {
         if now >= self.next {
             self.seq = self.seq.wrapping_add(1);
-            let msg = builder.pdelay_req(self.seq);
+            let msg = builder.pdelay_req(self.seq, self.log_interval);
             let fallback = clock.now();
             if let Ok(raw) = sock.send_stamped(&msg) {
                 // Without a hardware t1 this measurement would be µs off.
@@ -70,7 +74,7 @@ impl PeerDelay {
                     st.counters.tx_stamp_missed += 1;
                     st.counters.pdelay_req_tx += 1;
                     self.pending = None;
-                    self.next = crate::gm::catch_up(self.next, INTERVAL, now);
+                    self.next = crate::gm::catch_up(self.next, self.interval, now);
                     return;
                 }
                 let t1 = stamp_to_tai(raw, sock, clock).unwrap_or(fallback);
@@ -85,9 +89,11 @@ impl PeerDelay {
                 });
                 state.lock().unwrap().counters.pdelay_req_tx += 1;
             }
-            self.next = crate::gm::catch_up(self.next, INTERVAL, now);
+            self.next = crate::gm::catch_up(self.next, self.interval, now);
         }
         if let Some(p) = &self.pending {
+            // An answer comes within milliseconds; at fast rates the next
+            // request replaces the exchange anyway.
             if now.duration_since(p.sent_at) > Duration::from_millis(900) {
                 self.pending = None;
             }
