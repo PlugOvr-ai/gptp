@@ -334,7 +334,10 @@ pub struct Status {
     pub nodes: Vec<NodeInfo>,
     pub streams: Vec<StreamInfo>,
     pub link: LinkHealth,
+    /// Newest first, the last 200.
     pub events: VecDeque<String>,
+    /// Events logged since start, including those dropped from `events`.
+    pub events_logged: u64,
     pub tai_now_secs: u64,
     /// Present in monitor mode.
     pub sync: Option<SyncMonitor>,
@@ -366,6 +369,7 @@ impl Status {
             streams: Vec::new(),
             link: LinkHealth::default(),
             events: VecDeque::new(),
+            events_logged: 0,
             tai_now_secs: 0,
             sync: None,
             ptp1588: None,
@@ -381,5 +385,37 @@ impl Status {
         self.events
             .push_front(format!("{h:02}:{m:02}:{s:02}Z  {}", msg.into()));
         self.events.truncate(200);
+        self.events_logged += 1;
+    }
+
+    /// Events logged after the first `seen` ones, oldest first (those
+    /// already dropped from `events` are skipped).
+    pub fn events_since(&self, seen: u64) -> impl Iterator<Item = &String> {
+        let new = self.events_logged.saturating_sub(seen) as usize;
+        self.events.iter().take(new).rev()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn events_since_survives_the_cap() {
+        let mut st = Status::new("eth0".into());
+        for i in 0..250 {
+            st.log(format!("e{i}"));
+        }
+        assert_eq!(st.events.len(), 200);
+        let seen = st.events_logged;
+        st.log("e250");
+        st.log("e251");
+        let new: Vec<_> = st.events_since(seen).collect();
+        assert_eq!(new.len(), 2);
+        assert!(new[0].ends_with("e250") && new[1].ends_with("e251"));
+        // Dropped events are skipped, the rest come oldest first.
+        let all: Vec<_> = st.events_since(0).collect();
+        assert_eq!(all.len(), 200);
+        assert!(all[0].ends_with("e52"));
     }
 }

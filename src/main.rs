@@ -111,8 +111,9 @@ fn main() -> Result<()> {
         aux.push(thread::spawn(move || metrics::run(path, state, quit)));
     }
 
+    let mut printed_events = 0;
     let ui_result = if cfg.no_tui {
-        run_headless(&state, &cmd_tx)
+        run_headless(&state, &cmd_tx, &mut printed_events)
     } else {
         tui::run(Arc::clone(&state), cmd_tx)
     };
@@ -125,13 +126,29 @@ fn main() -> Result<()> {
         let _ = t.join();
     }
     ui_result?;
-    match engine.join() {
+    let res = match engine.join() {
         Ok(res) => res,
         Err(_) => anyhow::bail!("gPTP engine panicked"),
+    };
+    if cfg.no_tui {
+        // Events from the last seconds, e.g. a capture written on shutdown.
+        print_new_events(&state.lock().unwrap(), &mut printed_events);
     }
+    res
 }
 
-fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Result<()> {
+fn print_new_events(st: &Status, printed: &mut u64) {
+    for e in st.events_since(*printed) {
+        println!("{e}");
+    }
+    *printed = st.events_logged;
+}
+
+fn run_headless(
+    state: &Arc<Mutex<Status>>,
+    cmds: &mpsc::Sender<gm::Cmd>,
+    printed_events: &mut u64,
+) -> Result<()> {
     unsafe {
         libc::signal(
             libc::SIGINT,
@@ -142,16 +159,10 @@ fn run_headless(state: &Arc<Mutex<Status>>, cmds: &mpsc::Sender<gm::Cmd>) -> Res
             on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
         );
     }
-    let mut printed_events = 0usize;
     while RUNNING.load(Ordering::SeqCst) {
         {
             let st = state.lock().unwrap();
-            // Print new events oldest-first (they are stored newest-first).
-            let new = st.events.len().saturating_sub(printed_events);
-            for e in st.events.iter().take(new).collect::<Vec<_>>().iter().rev() {
-                println!("{e}");
-            }
-            printed_events = st.events.len().min(200);
+            print_new_events(&st, printed_events);
             let role = match st.role {
                 Role::ActiveGm => "ACTIVE-GM",
                 Role::Seeding => "SEEDING",
