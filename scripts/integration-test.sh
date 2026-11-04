@@ -113,7 +113,9 @@ if tc qdisc add dev pM root netem delay 1ms 2>/dev/null; then
     run "$OUT/a2.log" vethA
     run "$OUT/m2.log" vethM --monitor --capture-dir "$OUT/cap2"
     sleep 14
-    tc qdisc add dev pM root netem delay 2ms 1ms
+    # With a rate, netem keeps the frame order as a switch does; without,
+    # a Follow_Up often overtakes its Sync and that Sync is lost.
+    tc qdisc add dev pM root netem delay 2ms 1ms rate 1gbit
     sleep 4
     tc qdisc del dev pM root
     sleep 15

@@ -61,7 +61,8 @@ sleep 20
 PORT=$("${DC[@]}" exec -T switch cat /run/lab/port-2)
 step "1. path-delay jitter on switch port $PORT (toward the sensors)"
 NETEM=0
-if "${DC[@]}" exec -T switch tc qdisc add dev "$PORT" root netem delay 2ms 1ms; then
+# The rate keeps the frame order, as a real switch does.
+if "${DC[@]}" exec -T switch tc qdisc add dev "$PORT" root netem delay 2ms 1ms rate 1gbit; then
     NETEM=1
     sleep 4
     "${DC[@]}" exec -T switch tc qdisc del dev "$PORT" root

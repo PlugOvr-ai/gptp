@@ -64,7 +64,7 @@ docker compose -f lab/compose.yaml run --rm monitor-tui     # live TUI
 
 # faults
 PORT=$(docker compose -f lab/compose.yaml exec -T switch cat /run/lab/port-2)
-docker compose -f lab/compose.yaml exec switch tc qdisc add dev $PORT root netem delay 2ms 1ms
+docker compose -f lab/compose.yaml exec switch tc qdisc add dev $PORT root netem delay 2ms 1ms rate 1gbit
 docker compose -f lab/compose.yaml exec switch tc qdisc del dev $PORT root
 docker compose -f lab/compose.yaml exec switch tc qdisc add dev $PORT root netem loss 20%
 docker compose -f lab/compose.yaml stop gm      # GM failure
