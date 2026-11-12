@@ -41,6 +41,11 @@
 #        The wait is bounded by GM_PREP_MAX_WAIT (s, default 600, set in the
 #        unit); then the grandmaster starts anyway, with a WARNING.
 #
+# The service logs a status block every 5 s, with one node: line per node of
+# the inventory. To write less to the journal (e.g. on an SD card):
+#
+#   ... | sudo sh -s -- eth0 --status-interval 60 --node-log-interval changed --probe-interval 5
+#
 # Running it again without arguments updates the binary and restarts the
 # installed services.
 #

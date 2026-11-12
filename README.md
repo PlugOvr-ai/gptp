@@ -39,7 +39,7 @@ master's time for jumps and instability instead.
   countdown (reactivates the GM if already handed over).
 - **Node inventory with latency probing**: passively learns the MAC/IP of
   every device that sends any traffic on the segment, and probes each known
-  IP once per second — ICMP echo, falling back to ARP-request RTT for nodes
+  IP once per second (`--probe-interval`) — ICMP echo, falling back to ARP-request RTT for nodes
   that ignore ICMP. The TUI shows per node: IP, MAC, last/average RTT,
   jitter, probe loss, and last-seen age; jitter above 1 ms is flagged red.
   `--scan-subnet 10.0.0.0/24` additionally ARP-sweeps a subnet every 60 s to
@@ -210,7 +210,10 @@ master's time for jumps and instability instead.
   for you (below).
 - `--no-tui` runs headless and prints status lines (including per-node
   latency lines) — use this for a systemd service. ALARM events appear in
-  both the TUI event log and the headless output.
+  both the TUI event log and the headless output, as they happen. By
+  default the status lines and one `node:` line per inventory node are
+  printed every 5 s: with 15 nodes that is about 260,000 journal lines a
+  day. On an SD card, print less (see below).
 
 ## Install
 
@@ -353,6 +356,9 @@ Selected options (see `--help` for all):
 | `--no-inventory` | off | disable node discovery and latency probing |
 | `--names <file>` | off | curated node names, one `<mac\|ip> = <name>` per line |
 | `--log-metrics <file>` | off | append JSONL health snapshots every 5 s |
+| `--status-interval <s>` | 5 | `--no-tui`: print the status lines every s seconds (events are printed as they happen) |
+| `--node-log-interval <s\|changed>` | status interval | `--no-tui`: print the `node:` lines every s seconds; `0` = never; `changed` = a node only when it appears, its IP or name changes, it goes silent (nothing heard for 120 s) or is heard again, a probe goes unanswered or is answered again, or its jitter exceeds 1 ms or drops below 0.8 ms (the line then ends in `change=…`) |
+| `--probe-interval <s>` | 1 | inventory: ICMP/ARP probe of each node every s seconds |
 
 ## Run as a systemd service
 
@@ -368,6 +374,17 @@ sudo ./scripts/install-service.sh eth0 --handover 15
 journalctl -fu gptp-gm                        # follow the status log
 sudo ./scripts/install-service.sh --uninstall # remove service(s) + binary
 ```
+
+**Journal volume.** The service prints a status block every 5 s and one
+`node:` line per inventory node with it. On an SD card, print less, e.g.:
+
+```sh
+... | sudo sh -s -- eth0 --status-interval 60 --node-log-interval changed --probe-interval 5
+```
+
+ALARM and WARNING events are still printed as they happen. With
+`--node-log-interval changed` a node is logged only when it appears or
+changes (silent, unanswered probes, jitter above 1 ms, …).
 
 With `--monitor` the script installs a separate `gptp-monitor` service, so
 a grandmaster and a monitor can coexist on different interfaces (it warns

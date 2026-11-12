@@ -46,6 +46,25 @@ pub enum GmClock {
     PhcDisciplined,
 }
 
+/// When headless mode prints the `node:` lines (`--node-log-interval`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeLog {
+    /// All nodes every this many seconds; 0 = never.
+    Every(u64),
+    /// A node when it appears, when it goes silent or is heard again, and
+    /// probe loss or jitter crossing the thresholds.
+    Changed,
+}
+
+fn parse_node_log(s: &str) -> Result<NodeLog, String> {
+    if s == "changed" {
+        return Ok(NodeLog::Changed);
+    }
+    s.parse()
+        .map(NodeLog::Every)
+        .map_err(|_| format!("'{s}' is neither a number of seconds nor 'changed'"))
+}
+
 /// gPTP (IEEE 802.1AS) grandmaster with timed handover, and slave monitor.
 ///
 /// Sends Announce + Sync/Follow_Up as forced grandmaster on one interface and
@@ -276,6 +295,16 @@ pub struct Config {
     #[arg(long)]
     pub no_inventory: bool,
 
+    /// Inventory: probe each node (ICMP echo + ARP request) every this many
+    /// seconds
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    pub probe_interval: u64,
+
     /// Names file for the inventory: one "<mac|ip> = <display name>" per
     /// line. Curated names always win over discovered ones.
     #[arg(long, value_name = "FILE")]
@@ -286,9 +315,28 @@ pub struct Config {
     #[arg(long, value_name = "FILE")]
     pub log_metrics: Option<String>,
 
-    /// Run without the TUI and log status lines to stdout instead
+    /// Run without the TUI and log status lines to stdout instead. Events
+    /// (ALARM, WARNING, ...) are printed as they happen
     #[arg(long)]
     pub no_tui: bool,
+
+    /// --no-tui: print the status lines (status:, sync:, clock:, ...) every
+    /// this many seconds
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..=86400)
+    )]
+    pub status_interval: u64,
+
+    /// --no-tui: print the node: lines of the inventory every this many
+    /// seconds (default: the status interval; 0 = never), or "changed": a
+    /// node only when it appears, its IP or name changes, it goes silent
+    /// (nothing heard for 120 s) or is heard again, or its probe loss or
+    /// jitter (> 1 ms) starts or ends
+    #[arg(long, value_name = "SECS|changed", value_parser = parse_node_log)]
+    pub node_log_interval: Option<NodeLog>,
 }
 
 impl Config {

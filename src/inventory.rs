@@ -31,7 +31,8 @@ const MDNS_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_PORT: u16 = 5353;
 const NAME_QUERY_INTERVAL: Duration = Duration::from_secs(60);
 
-const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// Traffic rates and stream checks; probing has its own interval.
+const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_NODES: usize = 256;
 
@@ -58,13 +59,22 @@ pub fn run(
     iface: String,
     our_mac: [u8; 6],
     scan_subnet: Option<(Ipv4Addr, u8)>,
+    probe_interval: Duration,
     static_names: StaticNames,
     state: Arc<Mutex<Status>>,
     quit: Arc<AtomicBool>,
 ) {
     match Sockets::open(&iface) {
         Ok(socks) => {
-            if let Err(e) = event_loop(socks, our_mac, scan_subnet, static_names, &state, &quit) {
+            if let Err(e) = event_loop(
+                socks,
+                our_mac,
+                scan_subnet,
+                probe_interval,
+                static_names,
+                &state,
+                &quit,
+            ) {
                 state
                     .lock()
                     .unwrap()
@@ -84,6 +94,7 @@ fn event_loop(
     socks: Sockets,
     our_mac: [u8; 6],
     scan_subnet: Option<(Ipv4Addr, u8)>,
+    probe_interval: Duration,
     static_names: StaticNames,
     state: &Arc<Mutex<Status>>,
     quit: &Arc<AtomicBool>,
@@ -92,7 +103,8 @@ fn event_loop(
     let icmp_id = std::process::id() as u16;
     let mut nodes: HashMap<[u8; 6], Node> = HashMap::new();
     let mut streams = StreamTracker::default();
-    let mut next_probe = Instant::now() + PROBE_INTERVAL;
+    let mut next_tick = Instant::now() + TICK_INTERVAL;
+    let mut next_probe = next_tick;
     let mut next_sweep = Instant::now();
     let mut buf = [0u8; 2048];
 
@@ -119,14 +131,20 @@ fn event_loop(
             }
         }
 
-        if now >= next_probe {
-            next_probe = now + PROBE_INTERVAL;
+        if now >= next_tick {
+            next_tick = now + TICK_INTERVAL;
             for alarm in streams.tick() {
                 state.lock().unwrap().log(alarm);
             }
             for node in nodes.values_mut() {
                 node.info.rate_bps = (node.bytes - node.bytes_last) as f64 * 8.0;
                 node.bytes_last = node.bytes;
+            }
+        }
+
+        if now >= next_probe {
+            next_probe = now + probe_interval;
+            for node in nodes.values_mut() {
                 let Some(ip) = node.info.ip else { continue };
                 finalize_tick(node);
                 node.icmp_seq = node.icmp_seq.wrapping_add(1);
@@ -377,10 +395,12 @@ fn finalize_tick(node: &mut Node) {
         (None, Some(rtt)) => (rtt, ProbeMethod::Arp),
         (None, None) => {
             node.info.probes_lost += 1;
+            node.info.last_probe_lost = true;
             return;
         }
     };
     let info = &mut node.info;
+    info.last_probe_lost = false;
     info.method = method;
     if let Some(avg) = info.rtt_avg_us {
         let jitter = (rtt_us - avg).abs();

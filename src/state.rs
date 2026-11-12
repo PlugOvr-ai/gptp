@@ -235,6 +235,8 @@ pub struct NodeInfo {
     pub jitter_us: Option<f64>,
     pub probes_sent: u64,
     pub probes_lost: u64,
+    /// The latest probe round went unanswered.
+    pub last_probe_lost: bool,
     pub method: ProbeMethod,
     /// Observed traffic from this node, bits/s over the last second.
     pub rate_bps: f64,
@@ -253,6 +255,7 @@ impl NodeInfo {
             jitter_us: None,
             probes_sent: 0,
             probes_lost: 0,
+            last_probe_lost: false,
             method: ProbeMethod::None,
             rate_bps: 0.0,
         }
