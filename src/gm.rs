@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::clock::{stamp_to_tai, tx_stamp_missed, TaiClock};
-use crate::config::Config;
+use crate::config::{Config, SystemClockScale};
 use crate::gmclock;
 use crate::net::{self, RawSock};
 use crate::pdelay::PeerDelay;
@@ -15,6 +15,7 @@ use crate::ptp::{self, AnnounceData, Msg};
 use crate::ptp1588::Port1588;
 use crate::seed::{self, Seeder};
 use crate::state::{ForeignMaster, Ptp1588Status, Role, Status};
+use crate::systemclock;
 
 pub enum Cmd {
     Quit,
@@ -86,6 +87,13 @@ pub fn run(
             cfg.iface(),
             ptp::fmt_clock_identity(&clock_identity)
         ));
+        if cfg.system_clock == SystemClockScale::Tai && !systemclock::is_on_tai() {
+            st.log(
+                "WARNING: --system-clock tai, but the system clock was not stepped to TAI \
+                 (gptp-gm --set-system-clock tai) — if it is on UTC, the served time is \
+                 the UTC offset behind",
+            );
+        }
         if seeder.is_some() {
             st.role = Role::Seeding;
             st.log(format!(

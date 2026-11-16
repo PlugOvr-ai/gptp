@@ -20,6 +20,15 @@ pub enum TimeSync {
     Ntp,
 }
 
+/// The timescale of the system clock (`--system-clock`).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemClockScale {
+    /// UTC, as usual
+    Utc,
+    /// TAI (UTC + --utc-offset), the PTP timescale
+    Tai,
+}
+
 /// Transport of the IEEE 1588 PTP served beside gPTP (`--ptp`).
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PtpTransport {
@@ -80,7 +89,7 @@ fn parse_node_log(s: &str) -> Result<NodeLog, String> {
 #[command(version, about)]
 pub struct Config {
     /// Network interface to serve gPTP on (e.g. eth0)
-    #[arg(required_unless_present = "remove_time_sync")]
+    #[arg(required_unless_present_any = ["remove_time_sync", "set_system_clock"])]
     pub interface: Option<String>,
 
     /// Serve time for this many minutes, then hand over to the switch.
@@ -276,6 +285,29 @@ pub struct Config {
     /// UTC-to-TAI offset in seconds, used when the kernel TAI offset is unset
     #[arg(long, default_value_t = 37)]
     pub utc_offset: i16,
+
+    /// Grandmaster: the timescale of the system clock. tai: it already
+    /// holds TAI (set with --set-system-clock tai) and is served unchanged;
+    /// Announce still carries the UTC offset
+    #[arg(
+        long,
+        value_enum,
+        value_name = "SCALE",
+        default_value = "utc",
+        conflicts_with = "monitor"
+    )]
+    pub system_clock: SystemClockScale,
+
+    /// Step the system clock to this timescale and exit (as root): tai adds
+    /// --utc-offset once (recorded in /run, so repeated calls and reboots do
+    /// not add it twice), utc undoes the recorded step
+    #[arg(long, value_enum, value_name = "SCALE", conflicts_with_all = ["remove_time_sync", "setup_time_sync"])]
+    pub set_system_clock: Option<SystemClockScale>,
+
+    /// With --set-system-clock: the clock was just set to UTC (e.g. by
+    /// NTP), so an earlier step no longer applies
+    #[arg(long, requires = "set_system_clock")]
+    pub clock_just_set: bool,
 
     /// Do not use NIC hardware timestamping even if available
     #[arg(long)]

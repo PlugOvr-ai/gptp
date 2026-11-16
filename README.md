@@ -276,6 +276,27 @@ NTP step itself cannot trip it); on expiry the grandmaster starts anyway
 with a WARNING in the journal — a GM with the wrong time beats no GM. Not
 combinable with `--time-sync ntp|builtin|linuxptp`.
 
+**System clock on TAI** (`--system-clock tai`, with `--ntp-once`): for
+networks whose slaves copy the PTP time into their system clocks unchanged
+(`phc2sys -O 0`), so they run on TAI — then the grandmaster's own data
+should too, not 37 s behind:
+
+```sh
+... | sudo sh -s -- eth0 --ntp-once 192.168.1.1 --system-clock tai
+```
+
+The system clock is stepped by `+--utc-offset` (37 s) early at boot,
+before other services start (`gptp-gm-system-clock-tai.service`: the clock
+comes from the RTC, on UTC), and again after each NTP sync of the gate,
+after `hwclock -w` — so the RTC stays UTC. The step is recorded in `/run`:
+a restart without internet does not add a second 37 s, and stopping the
+unit steps back exactly. Stepping also marks the kernel clock unsynchronized,
+which keeps the kernel's 11-minute RTC update from writing TAI into the RTC.
+The grandmaster serves the clock as it is and still announces the UTC
+offset (37, valid). `--uninstall gm`, or installing again without the
+option, steps the clock back to UTC and removes the unit. By hand:
+`gptp-gm --set-system-clock tai|utc` (root).
+
 The installer picks the binary for the CPU, verifies its SHA-256, and
 installs it to `/usr/local/bin/gptp-gm`. Run it again without arguments to
 update — installed services are restarted on the new version.
@@ -348,6 +369,8 @@ Selected options (see `--help` for all):
 | `--log-announce-interval <n>` | 0 | log2 Announce interval (0 = 1/s, 1 = every 2 s; -3..4). Peers time out after 3 intervals, so slower also delays the takeover after a handover |
 | `--log-pdelay-req-interval <n>` | 0 | log2 Pdelay_Req interval of our own peer-delay measurement (0 = 1/s; -3..5); requests from neighbors are always answered |
 | `--utc-offset <s>` | 37 | UTC→TAI offset when the kernel TAI offset is unset |
+| `--system-clock <utc\|tai>` | utc | grandmaster: the system clock already holds TAI, serve it unchanged (installer: with `--ntp-once`, sets it all up) |
+| `--set-system-clock <utc\|tai>` | — | one-shot (root): step the system clock to TAI by `--utc-offset`, at most once per boot or NTP sync (`--clock-just-set`), or back to UTC |
 | `--gm-clock <src>` | auto | time source: `phc-disciplined` with hardware timestamps, else `system`; or `phc` (free-running NIC clock) |
 | `--seed-from-gnss` | off | before announcing, take time and frequency from a GNSS-locked master on the network (clockClass 6/7), then take over; `--seed-wait <s>` (60) |
 | `--ptp <udp\|l2>` | off | GM: also serve IEEE 1588 PTP (default profile, E2E) beside gPTP on the same interface; monitor: watch a 1588 master instead of gPTP; `--ptp-domain` (0), `--ptp-log-sync-interval` (0) |
@@ -407,7 +430,8 @@ restart the service, so a reinstall picks up new code and arguments.
 - PTP uses the TAI timescale. If the kernel's TAI offset is configured (e.g.
   by chrony's `leapsectz right/UTC`), it is used directly; otherwise the
   program falls back to `CLOCK_REALTIME` plus `--utc-offset` (37 s since
-  2017). Keep the Pi's system clock disciplined (GNSS/NTP) — this program
+  2017). With `--system-clock tai` the system clock already holds TAI and is
+  served as it is. Keep the Pi's system clock disciplined (GNSS/NTP) — this program
   distributes the system clock, it does not discipline it.
 - **Hardware timestamping is used automatically** when the NIC supports it
   (e.g. Raspberry Pi 5 / CM4; check with `ethtool -T eth0`): frames are

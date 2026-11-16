@@ -2,17 +2,22 @@
 //!
 //! If the kernel's TAI offset is configured (e.g. by chrony/ptp4l via
 //! adjtimex), it is used directly. Otherwise we fall back to a configured
-//! static UTC offset (37 s since 2017). All conversions are anchored to
-//! CLOCK_REALTIME so kernel software timestamps (which are realtime-based)
-//! can be translated exactly.
+//! static UTC offset (37 s since 2017). With `--system-clock tai` the system
+//! clock already holds TAI and is used as it is. All conversions are
+//! anchored to CLOCK_REALTIME so kernel software timestamps (which are
+//! realtime-based) can be translated exactly.
 
 use crate::net::{RawSock, RawStamp};
 use crate::ptp::Timestamp;
 
 #[derive(Clone, Copy)]
 pub struct TaiClock {
+    /// Added to CLOCK_REALTIME to get TAI.
     offset_secs: i64,
+    /// currentUtcOffset announced (TAI − UTC).
+    utc_offset: i16,
     kernel_tai: bool,
+    system_on_tai: bool,
     /// Deliberate error added to the served time (--time-error), ns.
     error_ns: i128,
     /// The grandmaster's time is this NIC hardware clock (which carries
@@ -21,18 +26,29 @@ pub struct TaiClock {
 }
 
 impl TaiClock {
-    pub fn new(utc_offset: i16) -> Self {
+    /// `system_on_tai`: CLOCK_REALTIME already holds TAI (`--system-clock
+    /// tai`); `utc_offset` is then only announced.
+    pub fn new(utc_offset: i16, system_on_tai: bool) -> Self {
         // The kernel TAI offset is set iff CLOCK_TAI differs from CLOCK_REALTIME.
         let diff_ns = raw(libc::CLOCK_TAI).to_ns() - raw(libc::CLOCK_REALTIME).to_ns();
         let kernel_offset = ((diff_ns + 500_000_000) / 1_000_000_000) as i64;
-        let kernel_tai = kernel_offset != 0;
+        let kernel_tai = kernel_offset != 0 && !system_on_tai;
+        let offset_secs = if system_on_tai {
+            0
+        } else if kernel_tai {
+            kernel_offset
+        } else {
+            utc_offset as i64
+        };
         TaiClock {
-            offset_secs: if kernel_tai {
-                kernel_offset
+            offset_secs,
+            utc_offset: if kernel_tai {
+                kernel_offset as i16
             } else {
-                utc_offset as i64
+                utc_offset
             },
             kernel_tai,
+            system_on_tai,
             error_ns: 0,
             phc: None,
         }
@@ -80,11 +96,13 @@ impl TaiClock {
     }
 
     pub fn utc_offset(&self) -> i16 {
-        self.offset_secs as i16
+        self.utc_offset
     }
 
     pub fn describe(&self) -> &'static str {
-        if self.kernel_tai {
+        if self.system_on_tai {
+            "system clock on TAI"
+        } else if self.kernel_tai {
             "system clock (kernel TAI offset)"
         } else {
             "system clock + static UTC offset"

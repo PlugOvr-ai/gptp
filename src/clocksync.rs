@@ -74,6 +74,16 @@ impl Adjtimex {
         }
     }
 
+    /// Mark the clock unsynchronized, which also stops the kernel's
+    /// 11-minute copy of the system time into the RTC.
+    pub fn set_unsynced() -> io::Result<()> {
+        let status = Self::read()?.status;
+        let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+        tx.modes = libc::ADJ_STATUS;
+        tx.status = status | libc::STA_UNSYNC;
+        Self::call(&mut tx).map(|_| ())
+    }
+
     fn read() -> io::Result<libc::timex> {
         let mut tx: libc::timex = unsafe { std::mem::zeroed() };
         Self::call(&mut tx)?;

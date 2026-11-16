@@ -17,6 +17,7 @@ mod seed;
 mod state;
 mod streams;
 mod syncdiag;
+mod systemclock;
 mod timesync_setup;
 mod tui;
 
@@ -42,6 +43,9 @@ extern "C" fn on_signal(_: libc::c_int) {
 fn main() -> Result<()> {
     let cfg = Config::parse();
 
+    if let Some(scale) = cfg.set_system_clock {
+        return systemclock::set(scale, cfg.utc_offset, cfg.clock_just_set);
+    }
     if cfg.remove_time_sync {
         return timesync_setup::remove(&cfg);
     }
@@ -75,7 +79,11 @@ fn main() -> Result<()> {
         cfg.ptp == Some(config::PtpTransport::Udp),
     )?;
     let our_mac = sock.mac;
-    let clock = clock::TaiClock::new(cfg.utc_offset).with_error(cfg.time_error);
+    let clock = clock::TaiClock::new(
+        cfg.utc_offset,
+        cfg.system_clock == config::SystemClockScale::Tai,
+    )
+    .with_error(cfg.time_error);
     let state = Arc::new(Mutex::new(Status::new(cfg.iface().to_string())));
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let inv_quit = Arc::new(AtomicBool::new(false));

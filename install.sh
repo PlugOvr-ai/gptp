@@ -40,6 +40,11 @@
 #        systemd-timesyncd is disabled otherwise (restored by --uninstall gm).
 #        The wait is bounded by GM_PREP_MAX_WAIT (s, default 600, set in the
 #        unit); then the grandmaster starts anyway, with a WARNING.
+#   ... | sudo sh -s -- eth0 --ntp-once 192.168.1.1 --system-clock tai
+#        the system clock runs on TAI (UTC + --utc-offset, 37 s), like slaves
+#        that copy PTP time unchanged (phc2sys -O 0): stepped early at boot
+#        (RTC, UTC) and after each NTP sync; the RTC stays UTC. Served as it
+#        is. --uninstall gm steps it back.
 #
 # The service logs a status block every 5 s, with one node: line per node of
 # the inventory. To write less to the journal (e.g. on an SD card):
@@ -93,10 +98,15 @@ write_gate() {
 #
 # GM_PREP_MAX_WAIT (s, default 600) bounds the whole wait; on expiry the
 # grandmaster starts anyway - a GM with the wrong time beats no GM.
+# GM_SYSTEM_CLOCK=tai: the system clock runs on TAI (UTC + GM_UTC_OFFSET,
+# default 37 s); after the NTP sync it is stepped there again.
 ROUTER="$1"
 HOSTS="$(printf '%s' "$2" | tr ',' ' ')"
 MAX_WAIT="${GM_PREP_MAX_WAIT:-600}"
 SYNCED=/run/systemd/timesync/synchronized
+SCALE=UTC
+[ "${GM_SYSTEM_CLOCK:-utc}" != tai ] || SCALE=TAI
+now() { date -u "+%F %T $SCALE"; }
 
 # Seconds since boot: the NTP step moves the wall clock, not this.
 uptime_s() { cut -d. -f1 /proc/uptime; }
@@ -104,7 +114,7 @@ DEADLINE=$(($(uptime_s) + MAX_WAIT))
 in_time() { [ "$(uptime_s)" -lt "$DEADLINE" ]; }
 give_up() {
     systemctl stop systemd-timesyncd 2>/dev/null
-    echo "WARNING: $1 within ${MAX_WAIT}s (GM_PREP_MAX_WAIT) - starting the grandmaster with an unsynced clock: $(date -u '+%F %T UTC')"
+    echo "WARNING: $1 within ${MAX_WAIT}s (GM_PREP_MAX_WAIT) - starting the grandmaster with an unsynced clock: $(now)"
     exit 0
 }
 reachable() { ping -c 1 -W 2 "$1" >/dev/null 2>&1; }
@@ -121,7 +131,7 @@ for h in $HOSTS; do
         sleep 1
     done
 done
-echo "Setting the clock with systemd-timesyncd (now $(date -u '+%F %T UTC'))..."
+echo "Setting the clock with systemd-timesyncd (now $(now))..."
 rm -f "$SYNCED"
 # restart, not start: a running instance may only poll again much later.
 systemctl restart systemd-timesyncd || give_up "systemd-timesyncd did not start"
@@ -130,9 +140,19 @@ until [ -e "$SYNCED" ]; do
     sleep 1
 done
 systemctl stop systemd-timesyncd
-echo "Clock set: $(date -u '+%F %T UTC') - NTP stopped, the clock runs free while the grandmaster serves it"
+SCALE=UTC
+echo "Clock set: $(now) - NTP stopped, the clock runs free while the grandmaster serves it"
 if { [ -e /dev/rtc0 ] || [ -e /dev/rtc ]; } && command -v hwclock >/dev/null 2>&1; then
     if hwclock -w; then echo "Saved to the RTC"; else echo "warning: writing the RTC failed"; fi
+fi
+if [ "${GM_SYSTEM_CLOCK:-utc}" = tai ]; then
+    # After the RTC got UTC. NTP set the clock to UTC: step it to TAI again.
+    if "$(dirname "$0")/gptp-gm" --set-system-clock tai --clock-just-set --utc-offset "${GM_UTC_OFFSET:-37}"; then
+        SCALE=TAI
+        echo "System clock on TAI: $(now)"
+    else
+        echo "WARNING: stepping the system clock to TAI failed - it stays on UTC"
+    fi
 fi
 exit 0
 EOF
@@ -149,6 +169,39 @@ restore_ntp() {
     esac
     $SUDO rm -f "$NTP_STATE" "$GATE"
     say "Restored systemd-timesyncd (${prev:-disabled})"
+}
+
+# --system-clock tai: an early boot unit steps the system clock from UTC (RTC)
+# to TAI before other services start, and back when stopped.
+TAI_UNIT=gptp-gm-system-clock-tai
+
+write_tai_unit() { # <utc offset>
+    $SUDO tee "$(unit_path "$TAI_UNIT")" >/dev/null <<EOF
+[Unit]
+Description=gptp-gm: system clock on TAI (UTC + $1 s)
+Documentation=https://github.com/$REPO
+DefaultDependencies=no
+After=local-fs.target fake-hwclock.service
+Before=sysinit.target time-set.target shutdown.target gptp-gm.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$BIN --set-system-clock tai --utc-offset $1
+ExecStop=$BIN --set-system-clock utc
+
+[Install]
+WantedBy=sysinit.target
+EOF
+}
+
+# Undo --system-clock tai: back to UTC, unit removed.
+remove_tai_unit() {
+    [ -e "$(unit_path "$TAI_UNIT")" ] || return 0
+    $SUDO systemctl disable --now "$TAI_UNIT" >/dev/null 2>&1 || say "warning: stepping the system clock back to UTC failed"
+    $SUDO rm -f "$(unit_path "$TAI_UNIT")"
+    say "System clock back on UTC"
 }
 
 # NTP clients whose packages exclude systemd-timesyncd's (Debian/Ubuntu:
@@ -210,7 +263,11 @@ if [ "${1:-}" = "--uninstall" ]; then
             say "Removed $svc service"
         fi
     done
-    case " $remove " in *" gptp-gm "*) restore_ntp ;; esac
+    case " $remove " in *" gptp-gm "*)
+        remove_tai_unit
+        restore_ntp
+        ;;
+    esac
     # The time services setup is shared: undone with the last service.
     if [ ! -e "$(unit_path gptp-gm)" ] && [ ! -e "$(unit_path gptp-monitor)" ] \
         && [ -e /etc/gptp-gm/time-sync.state ] && [ -x "$BIN" ]; then
@@ -247,6 +304,8 @@ NTP_ONCE=""
 INTERNET_CHECK=""
 SEED=0
 PTP=""
+SYSTEM_CLOCK=""
+UTC_OFFSET=37
 prev=""
 for arg in "$@"; do
     case "$prev" in
@@ -257,8 +316,10 @@ for arg in "$@"; do
         --capture-dir) CAPTURE_DIR="$arg" ;;
         --time-sync) TIME_SYNC="$arg" ;;
         --sync-phc) SYNC_PHCS="$SYNC_PHCS $arg" ;;
+        --system-clock) SYSTEM_CLOCK="$arg" ;;
         --utc-offset | --neighbor-prop-delay-thresh) SETUP_EXTRA="$SETUP_EXTRA $prev $arg" ;;
     esac
+    [ "$prev" != --utc-offset ] || UTC_OFFSET="$arg"
     case "$arg" in
         --monitor) MONITOR=1 ;;
         --seed-from-gnss) SEED=1 ;;
@@ -269,11 +330,19 @@ for arg in "$@"; do
         --capture-dir=*) CAPTURE_DIR="${arg#--capture-dir=}" ;;
         --time-sync=*) TIME_SYNC="${arg#--time-sync=}" ;;
         --sync-phc=*) SYNC_PHCS="$SYNC_PHCS ${arg#--sync-phc=}" ;;
+        --system-clock=*) SYSTEM_CLOCK="${arg#--system-clock=}" ;;
         --utc-offset=* | --neighbor-prop-delay-thresh=*) SETUP_EXTRA="$SETUP_EXTRA $arg" ;;
         *" "*) die "arguments with spaces are not supported in the service command line: $arg" ;;
     esac
+    case "$arg" in --utc-offset=*) UTC_OFFSET="${arg#--utc-offset=}" ;; esac
     prev="$arg"
 done
+case "$SYSTEM_CLOCK" in
+    "" | utc) ;;
+    tai) [ -n "$NTP_ONCE" ] || die "--system-clock tai needs --ntp-once (the clock is set from NTP, then stepped to TAI)" ;;
+    *) die "--system-clock takes utc or tai, got $SYSTEM_CLOCK" ;;
+esac
+case "$UTC_OFFSET" in "" | *[!0-9]*) die "--utc-offset must be whole seconds, got $UTC_OFFSET" ;; esac
 case "$TIME_SYNC" in
     "" | none | ntp | builtin | linuxptp) ;;
     servo) TIME_SYNC=builtin ;;
@@ -541,6 +610,17 @@ TimeoutStartSec=infinity"
 elif [ "$MONITOR" -eq 0 ]; then
     restore_ntp # reinstalled without --ntp-once
 fi
+if [ "$SYSTEM_CLOCK" = tai ]; then
+    write_tai_unit "$UTC_OFFSET"
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable --now "$TAI_UNIT" >/dev/null 2>&1 || die "stepping the system clock to TAI failed (systemctl status $TAI_UNIT)"
+    say "System clock on TAI (UTC + $UTC_OFFSET s): stepped early at boot and after each NTP sync; the RTC stays UTC"
+    GATE_LINES="$GATE_LINES
+Environment=GM_SYSTEM_CLOCK=tai GM_UTC_OFFSET=$UTC_OFFSET"
+    AFTER_EXTRA="$AFTER_EXTRA $TAI_UNIT.service"
+elif [ "$MONITOR" -eq 0 ]; then
+    remove_tai_unit # reinstalled without --system-clock tai
+fi
 
 # --- Time sync (one-shot system configuration) ------------------------------------------------
 # After the --ntp-once step, which owns systemd-timesyncd.
@@ -609,6 +689,7 @@ echo
 say "Installed $SERVICE.service"
 echo "logs:      journalctl -fu $SERVICE"
 [ -z "$NTP_ONCE" ] || echo "clock:     set once per start via $NTP_ONCE ($INTERNET_CHECK), max wait ${GM_PREP_MAX_WAIT}s"
+[ "$SYSTEM_CLOCK" != tai ] || echo "           system clock on TAI (UTC + $UTC_OFFSET s), $TAI_UNIT.service"
 [ -z "$METRICS_FILE" ] || echo "metrics:   $METRICS_FILE"
 [ -z "$CAPTURE_DIR" ] || echo "captures:  $CAPTURE_DIR"
 echo "remove:    curl -fsSL https://github.com/$REPO/releases/latest/download/install.sh | sudo sh -s -- --uninstall $([ "$MONITOR" -eq 1 ] && echo monitor || echo gm)"
